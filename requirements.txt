@@ -1,0 +1,5 @@
+requests
+pytz
+lightstreamer-client
+streamlit
+pandas
