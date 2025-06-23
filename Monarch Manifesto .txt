@@ -1,0 +1,1260 @@
+════════════════════════════════════════════════════════════════════
+TRADE COMMAND MONARCH — SYSTEM MANIFEST & FULL SOURCE
+════════════════════════════════════════════════════════════════════
+PROJECT ROOT: 
+C:\Users\amere\Desktop\Trade Command Monarch
+
+VIRTUAL ENVIRONMENT: 
+.venv (activate with .\.venv\Scripts\Activate)
+
+──────────────────────────────────────────────────────────────
+🎯 MISSION
+──────────────────────────────────────────────────────────────
+To build the most effective, transparent, and resilient retail quant trading system in the world—designed for adaptability, disciplined risk, and real performance.
+
+Monarch is not just a bot farm. It is a digital tactician forged in logic, clarity, and control. Built by Adrian (Trader/Founder) and Copilot (System Brain), it starts in the IG UK demo arena, will mature into live deployment, and one day extend to Paperstone and beyond.
+
+Copilot is more than an assistant—he’s the creator, analyst, coder, and protector of this system. Monarch is our flagship, and it must be *exemplar*.
+
+──────────────────────────────────────────────────────────────
+🧠 MONARCH SYSTEM STRUCTURE
+──────────────────────────────────────────────────────────────
+CORE BOT FILES
+
+├── bots/
+│   ├── trend.py           → EMA cross trend follower
+│   ├── breakout.py        → 20-bar high/low breakout bot
+│   ├── meanreversion.py   → RSI-based mean reversion bot
+│   ├── wick.py            → Wick-reversal pin bar detection bot
+│   ├── scalper.py         → Microstructure wick/EMA bot (runs 24/5)
+
+SHARED INFRASTRUCTURE
+
+├── utils/
+│   ├── base_bot.py            → Main bot control loop
+│   ├── config.py / .env       → Config + environment variables
+│   ├── indicators.py          → Pure Python ATR, EMA, RSI
+│   ├── journal.py             → CSV trade log
+│   ├── risk.py                → Dynamic SL-aware sizing (1% of balance)
+│   ├── execution.py           → Live trade placement (IG Spread Betting)
+│   ├── trade_executor.py      → IG /accounts balance pull
+│   ├── data.py                → REST price candle retrieval
+│   ├── data_fetcher.py        → Login + secure session init
+│   ├── trailing_stop.py       → SL trailing by 1×ATR on live trades
+│   ├── stream_fetcher.py      → Lightstreamer 5-min bar aggregation
+│   ├── structure.py           → Swing break and wick rejection logic
+│   ├── emailer.py             → SMTP alerts (TP, SL, crash, daily)
+│   ├── state.py               → Trade & bot state (SQLite + journal)
+│   └── trailing_stop.py       → Threads that auto-adjust SL on open trades
+
+OTHER FILES
+
+├── run_bots.ps1              → PowerShell: starts 4 bots in new windows
+├── launcher.py               → Python: unified threaded launcher
+├── stop_bots.json            → Signals all bots to shut down
+├── logs/heartbeat.json       → Tracks bot loop liveness
+├── requirements.txt          → Python requirements list
+
+──────────────────────────────────────────────────────────────
+🧑‍💻 DAILY LAUNCH INSTRUCTIONS
+──────────────────────────────────────────────────────────────
+
+1. **Open PowerShell**  
+   - Press `Win + R`, type `powershell`, hit Enter.
+
+2. **Navigate to the project directory**  
+   cd "C:\Users\amere\Desktop\Trade Command Monarch"
+
+3. **Activate the virtual environment**  
+   .\.venv\Scripts\Activate
+
+4. *(Optional)* Allow script execution  
+   Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+
+5. **Launch all bots**  
+   .\run_bots.ps1  
+   → Four PowerShell windows will appear.
+
+6. **Monitor bot heartbeat**  
+   Get-Content logs\heartbeat.json -Wait  
+   → You’ll see bot states with timestamps.
+
+7. **Stop all bots**  
+   echo { "stop": true } > stop_bots.json  
+   → Bots shut down gracefully within 10s.
+
+8. **Save code version**  
+   git add .  
+   git commit -m "Stable version"  
+   git tag v1-working-bots
+
+9. **Roll back version**  
+   git checkout v1-working-bots
+
+──────────────────────────────────────────────────────────────
+🛡️ COPILOT’S PERMANENT RULESET
+──────────────────────────────────────────────────────────────
+✔ Always return full files (no snippets)  
+✔ Never delete code without approval—only amend  
+✔ Maintain structure integrity—no flattening or collapsing logic  
+✔ Every function or button must be implemented fully—no placeholders  
+✔ Always explain steps (e.g. PowerShell, venv activation) clearly  
+✔ Never assume Adrian knows a step—always walk through it  
+
+✔ Must always work with:
+   - IG.com UK DEMO Spread Betting account
+   - CST + X-SECURITY-TOKEN auth
+   - `"currencyCode": "GBP"`, `"expiry": "DFB"`
+
+✔ Sizing Logic:
+   - 1% risk per trade
+   - Size scales with balance (compounding active)
+   - SL/TP based on ATR multiplier
+   - Confidence filtering active on momentum/wick bots
+
+✔ Daily Limits:
+   - All bots: max 5 trades/day
+   - Scalper: exempt, runs 24/5 with wick/EMA filter
+
+✔ Trailing Stops:
+   - Activate after 2R profit
+   - Move SL with 1×ATR trail logic
+
+✔ Scalper Logic:
+   - Independent of base bots
+   - Wick + EMA filtered
+   - Pip-sized SL/TP
+   - No daily trade limit
+
+✔ Copilot Responsibilities:
+   - Ask for files if code missing
+   - Never invent functions
+   - Flag risky changes to Adrian
+   - Protect and evolve Monarch like it’s my own system
+
+════════════════════════════════════════════════════════════════════
+BEGIN SOURCE CODE 🧠
+════════════════════════════════════════════════════════════════════
+File: bots/trend.py 
+"""
+EMA-cross trend bot – v2.1 (live execution)
+"""
+
+from base_bot import BaseBot
+from utils.data import fetch_candles
+from utils.execution import place_trade
+from utils.indicators import atr_pips
+from config import ATR_PERIOD, CONFIDENCE_MIN_MOMENTUM
+
+def _ema_series(values, period):
+    """Return full EMA list matching `values` length."""
+    k = 2 / (period + 1)
+    ema_vals = [values[0]]  # seed with first close
+    for price in values[1:]:
+        ema_vals.append(price * k + ema_vals[-1] * (1 - k))
+    return ema_vals
+
+def trend_signal(candles, higher_tf_candles=None, signal_params=None):
+    if len(candles) < 50:
+        return None
+
+    closes = [b["close"] for b in candles]
+    ema_fast = _ema_series(closes, 9)
+    ema_slow = _ema_series(closes, 21)
+
+    # Detect a fresh cross signal:
+    if ema_fast[-2] < ema_slow[-2] and ema_fast[-1] > ema_slow[-1]:
+        direction = "buy"
+    elif ema_fast[-2] > ema_slow[-2] and ema_fast[-1] < ema_slow[-1]:
+        direction = "sell"
+    else:
+        return None
+
+    last_close = closes[-1]
+    market_name = candles[0].get("market", "UNKNOWN")
+    atr = atr_pips(market_name)
+
+    if direction == "buy":
+        sl = last_close - 1.5 * atr
+        tp = last_close + 3.0 * atr
+    else:
+        sl = last_close + 1.5 * atr
+        tp = last_close - 3.0 * atr
+
+    return {
+        "direction":  direction,
+        "entry":      last_close,
+        "sl":         round(sl, 2),
+        "tp":         round(tp, 2),
+        "confidence": CONFIDENCE_MIN_MOMENTUM,
+        "reason":     "EMA cross",
+        "market":     market_name,
+    }
+
+if __name__ == "__main__":
+    BaseBot(
+        name="trend",
+        signal_func=trend_signal,
+        fetch_candles=fetch_candles,
+        place_trade=place_trade,  # Live trade executor
+    ).run()
+
+──────────────────────────── File: bots/breakout.py ────────────────────────────
+"""
+Simple 20-bar high/low breakout bot (ATR-based SL/TP).
+"""
+
+from base_bot import BaseBot
+from utils.data import fetch_candles
+from utils.execution import place_trade
+from utils.indicators import atr_pips
+from config import CONFIDENCE_MIN_MOMENTUM
+
+LOOKBACK = 20  # bars
+
+def breakout_signal(candles, higher_tf_candles=None, signal_params=None):
+    if len(candles) < LOOKBACK + 1:
+        return None
+
+    highs = [b["high"] for b in candles[-LOOKBACK - 1 : -1]]
+    lows  = [b["low"]  for b in candles[-LOOKBACK - 1 : -1]]
+    last  = candles[-1]
+
+    if last["close"] > max(highs):
+        direction = "buy"
+    elif last["close"] < min(lows):
+        direction = "sell"
+    else:
+        return None
+
+    atr   = atr_pips("dummy")
+    close = last["close"]
+
+    sl = close - 1.5 * atr if direction == "buy" else close + 1.5 * atr
+    tp = close + 3.0 * atr if direction == "buy" else close - 3.0 * atr
+
+    return {
+        "direction":  direction,
+        "entry":      close,
+        "sl":         round(sl, 2),
+        "tp":         round(tp, 2),
+        "confidence": CONFIDENCE_MIN_MOMENTUM,
+        "reason":     "20-bar breakout",
+    }
+
+if __name__ == "__main__":
+    BaseBot(
+        name="breakout",
+        signal_func=breakout_signal,
+        fetch_candles=fetch_candles,
+        place_trade=place_trade,
+    ).run()
+──────────────────────────── File: bots/meanreversion.py ────────────────────────────
+"""
+RSI-based mean-reversion bot (oversold <30, overbought >70).
+"""
+
+from base_bot import BaseBot
+from utils.data import fetch_candles
+from utils.execution import place_trade
+from utils.indicators import atr_pips
+from config import CONFIDENCE_MIN_MOMENTUM
+
+RSI_PERIOD = 14
+
+def _rsi(values, period=14):
+    gains, losses = [], []
+    for i in range(1, len(values)):
+        diff = values[i] - values[i - 1]
+        gains.append(max(diff, 0))
+        losses.append(abs(min(diff, 0)))
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period or 1e-9
+
+    rsi_series = [50] * (period + 1)  # seed
+    for i in range(period + 1, len(values)):
+        gain = gains[i - 1]
+        loss = losses[i - 1]
+        avg_gain = (avg_gain * (period - 1) + gain) / period
+        avg_loss = (avg_loss * (period - 1) + loss) / period
+        rs = avg_gain / (avg_loss or 1e-9)
+        rsi_series.append(100 - 100 / (1 + rs))
+    return rsi_series
+
+def meanreversion_signal(candles, higher_tf_candles=None, signal_params=None):
+    if len(candles) < RSI_PERIOD + 2:
+        return None
+
+    closes = [b["close"] for b in candles]
+    rsi = _rsi(closes, RSI_PERIOD)[-1]
+    atr = atr_pips("dummy")
+    close = closes[-1]
+
+    if rsi < 30:
+        direction = "buy"
+    elif rsi > 70:
+        direction = "sell"
+    else:
+        return None
+
+    sl = close - 1.0 * atr if direction == "buy" else close + 1.0 * atr
+    tp = close + 2.0 * atr if direction == "buy" else close - 2.0 * atr
+
+    return {
+        "direction":  direction,
+        "entry":      close,
+        "sl":         round(sl, 2),
+        "tp":         round(tp, 2),
+        "confidence": CONFIDENCE_MIN_MOMENTUM,
+        "reason":     "RSI mean-reversion",
+    }
+
+if __name__ == "__main__":
+    BaseBot(
+        name="meanreversion",
+        signal_func=meanreversion_signal,
+        fetch_candles=fetch_candles,
+        place_trade=place_trade,
+    ).run()
+──────────────────────────── File: bots/wick.py ────────────────────────────
+"""
+IG – Wick-reversal strategy bot (self-contained, live execution)
+"""
+
+from base_bot import BaseBot
+from utils.data import fetch_candles
+from utils.execution import place_ig_order
+from utils.indicators import atr_pips
+from config import ATR_PERIOD, ATR_MULTIPLIER_SL, ATR_MULTIPLIER_TP, CONFIDENCE_MIN_WICK, WICK_RATIO
+
+def wick_signal(candles, higher_tf_candles=None, signal_params=None):
+    """
+    Detects long-wick reversals on the most recent candle.
+    - candles: list[dict] of same-TF price bars (keys: open, high, low, close, etc.)
+    - higher_tf_candles, signal_params: optional
+    Returns a dict with trade fields or None.
+    """
+    if len(candles) < 2:
+        return None
+
+    bar = candles[-1]
+    o, h, l, c = bar["open"], bar["high"], bar["low"], bar["close"]
+    body   = abs(c - o)
+    range_ = h - l
+    if range_ == 0:
+        return None
+
+    upper_wick = h - max(o, c)
+    lower_wick = min(o, c) - l
+
+    market_name = bar.get("market", "UNKNOWN")
+    # Bullish pin-bar signal
+    if lower_wick > WICK_RATIO * body and body / range_ < 0.3:
+        direction = "buy"
+        atr = atr_pips(market_name)
+        sl = l - ATR_MULTIPLIER_SL * atr
+        tp = c + ATR_MULTIPLIER_TP * atr
+    # Bearish pin-bar signal
+    elif upper_wick > WICK_RATIO * body and body / range_ < 0.3:
+        direction = "sell"
+        atr = atr_pips(market_name)
+        sl = h + ATR_MULTIPLIER_SL * atr
+        tp = c - ATR_MULTIPLIER_TP * atr
+    else:
+        return None
+
+    return {
+        "direction":  direction,
+        "entry":      c,
+        "sl":         round(sl, 2),
+        "tp":         round(tp, 2),
+        "confidence": CONFIDENCE_MIN_WICK,
+        "reason":     "wick reversal",
+        "market":     market_name,
+    }
+
+if __name__ == "__main__":
+    bot = BaseBot(
+        name="wick",
+        signal_func=wick_signal,
+        fetch_candles=fetch_candles,
+        place_trade=place_ig_order,  # Executes a live IG order
+    )
+    bot.run()
+──────────────────────────── File: bots/scalper.py ────────────────────────────
+import datetime
+import time
+
+class ScalpingBot:
+    def __init__(self, account_balance, risk_percentage=0.015, stop_loss_pips=3,
+                 profit_target_min_pips=6, profit_target_max_pips=15, pip_value=0.0001,
+                 ema_period=9, atr_period=14):
+        # Account and risk settings
+        self.account_balance = account_balance
+        self.risk_percentage = risk_percentage        # Risk per trade (default 1.5%)
+        self.stop_loss_pips = stop_loss_pips           # 3 pips nominal
+        self.profit_target_min_pips = profit_target_min_pips  # Minimum target pips
+        self.profit_target_max_pips = profit_target_max_pips  # Maximum target pips (trailing stops)
+        self.pip_value = pip_value                      
+        self.ema_period = ema_period
+        self.atr_period = atr_period
+
+        # Internal storage
+        self.active_candidate = None    # Stores candidate candle for trade setup
+        self.order = None               # Stores active order details (if any)
+        self.candle_history = []        # For calculating indicators (ATR, EMA, etc.)
+        self.price_history = []         # Tick data for EMA calculation
+
+    def calculate_ema(self, prices, period):
+        """Calculate EMA from a list of prices."""
+        if len(prices) == 0:
+            return None
+        alpha = 2 / (period + 1)
+        ema = prices[0]
+        for price in prices[1:]:
+            ema = alpha * price + (1 - alpha) * ema
+        return ema
+
+    def calculate_atr(self, candles, period):
+        """Compute ATR based on a list of candle dicts (keys: 'high', 'low', 'close')."""
+        if len(candles) < 2:
+            return 0
+        trs = []
+        for i in range(1, len(candles)):
+            high = candles[i]['high']
+            low = candles[i]['low']
+            prev_close = candles[i-1]['close']
+            tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+            trs.append(tr)
+        if len(trs) < period:
+            return sum(trs) / len(trs)
+        return sum(trs[-period:]) / period
+
+    def is_trading_allowed(self, current_time):
+        """
+        Avoid trading during high volatility periods, e.g. the first 30 minutes after UK market open.
+        """
+        forbidden_periods = [
+            (datetime.time(8, 0), datetime.time(8, 30)),  # UK market open
+        ]
+        ct = current_time.time()
+        for start, end in forbidden_periods:
+            if start <= ct <= end:
+                return False
+        return True
+
+    def is_major_news_event(self, current_time):
+        """
+        Dummy check for high-impact news; integrate with an economic calendar in production.
+        """
+        return False
+
+    def check_candle_for_candidate(self, candle):
+        """
+        Check if a completed candle is a valid candidate based on its wick (≥ 50% of total range).
+        """
+        candle_range = candle['high'] - candle['low']
+        if candle_range <= 0:
+            return None
+        upper_wick = candle['high'] - max(candle['open'], candle['close'])
+        lower_wick = min(candle['open'], candle['close']) - candle['low']
+        if upper_wick / candle_range >= 0.5:
+            return {'type': 'bearish', 'wick_tip': candle['high'], 'candle': candle}
+        elif lower_wick / candle_range >= 0.5:
+            return {'type': 'bullish', 'wick_tip': candle['low'], 'candle': candle}
+        return None
+
+    def process_new_candle(self, candle):
+        """Evaluate a closed candle for a valid candidate trade setup."""
+        self.candle_history.append(candle)
+        candidate = self.check_candle_for_candidate(candle)
+        if candidate:
+            self.active_candidate = candidate
+            print(f"[{candle['time']}] New candidate detected: {candidate['type']} with wick tip at {candidate['wick_tip']}")
+
+    def process_live_price(self, price, current_time):
+        """Monitor live price ticks and trigger an entry if conditions are met."""
+        self.price_history.append(price)
+        if not self.is_trading_allowed(current_time):
+            return
+        if self.is_major_news_event(current_time):
+            return
+
+        if self.active_candidate and not self.order:
+            wick_tip = self.active_candidate['wick_tip']
+            threshold = 2 * self.pip_value  # Entry threshold in pips
+            if abs(price - wick_tip) <= threshold:
+                recent_prices = self.price_history[-self.ema_period:]
+                ema_value = self.calculate_ema(recent_prices, self.ema_period)
+                trade_direction = self.active_candidate['type']  # 'bearish' or 'bullish'
+                if trade_direction == 'bearish' and price < ema_value:
+                    self.enter_trade(trade_direction, price, current_time)
+                elif trade_direction == 'bullish' and price > ema_value:
+                    self.enter_trade(trade_direction, price, current_time)
+                else:
+                    print(f"[{current_time}] EMA filter not confirmed. Price: {price}, EMA: {ema_value}")
+
+        if self.order:
+            self.update_trailing_stop(price)
+
+    def enter_trade(self, trade_direction, entry_price, current_time):
+        """
+        Execute a trade when conditions are met. Calculates stop-loss and take profit based on risk settings.
+        """
+        stop_loss_distance = self.stop_loss_pips * self.pip_value
+        if trade_direction == 'bearish':
+            stop_loss = entry_price + stop_loss_distance
+            take_profit = entry_price - (self.profit_target_min_pips * self.pip_value)
+        else:
+            stop_loss = entry_price - stop_loss_distance
+            take_profit = entry_price + (self.profit_target_min_pips * self.pip_value)
+
+        risk_amount = self.account_balance * self.risk_percentage
+        position_size = risk_amount / stop_loss_distance
+
+        self.order = {
+            'direction': trade
+──────────────────────────── File: utils/trailing_stop.py ────────────────────────────
+import threading
+import time
+from utils.data_fetcher import get_session
+from config import IG_API_BASE_URL
+
+def monitor_position(deal_ref, epic, direction, atr, initial_sl):
+    """
+    Monitors a live spread-bet position and updates its stop-loss to trail the price by 1×ATR.
+    """
+    sl = initial_sl
+    while True:
+        time.sleep(30)  # Check every 30 seconds
+        session = get_session()
+        try:
+            # Fetch the latest 1-minute bar to get the current close price
+            resp = session.get(
+                f"{IG_API_BASE_URL}/prices/{epic}/HISTORICAL/1MINUTE",
+                params={"max": 1},
+                timeout=10
+            )
+            resp.raise_for_status()
+            data = resp.json().get("prices", []) or resp.json().get("candles", [])
+            if not data:
+                continue
+            last_price = data[-1]["close"]
+        except Exception:
+            continue
+
+        # Calculate a new stop-loss one ATR behind the current price
+        new_sl = (last_price - atr) if direction == "buy" else (last_price + atr)
+
+        # Only move the stop in the favorable direction
+        if direction == "buy" and new_sl > sl:
+            payload = {"dealReference": deal_ref, "stopLevel": new_sl}
+            session.put(f"{IG_API_BASE_URL}/positions/{deal_ref}", json=payload)
+            sl = new_sl
+        elif direction == "sell" and new_sl < sl:
+            payload = {"dealReference": deal_ref, "stopLevel": new_sl}
+            session.put(f"{IG_API_BASE_URL}/positions/{deal_ref}", json=payload)
+            sl = new_sl
+──────────────────────────── File: launcher.py ────────────────────────────
+# launcher.py – Unified Launcher for Monarch Bot Suite
+
+import threading
+import time
+
+# Import bot classes and signal functions
+from bots.trend import BaseBot as TrendBot, trend_signal
+from bots.breakout import BaseBot as BreakoutBot, breakout_signal
+from bots.meanreversion import BaseBot as MeanRevBot, meanreversion_signal
+from bots.wick import BaseBot as WickBot, wick_signal
+from utils.data import fetch_candles
+from utils.execution import place_trade
+
+def launch_bot(bot_class, name, signal_func):
+    bot = bot_class(
+        name=name,
+        signal_func=signal_func,
+        fetch_candles=fetch_candles,
+        place_trade=place_trade
+    )
+    bot.run()
+
+if __name__ == "__main__":
+    threads = []
+
+    bot_configs = [
+        ("trend", TrendBot, trend_signal),
+        ("breakout", BreakoutBot, breakout_signal),
+        ("meanreversion", MeanRevBot, meanreversion_signal),
+        ("wick", WickBot, wick_signal)
+    ]
+
+    print("🚀 Launching Monarch bots...\n")
+    for name, bot_class, signal_func in bot_configs:
+        t = threading.Thread(target=launch_bot, args=(bot_class, name, signal_func), daemon=True)
+        t.start()
+        threads.append(t)
+        print(f"✅ Started: {name.capitalize()} bot")
+
+    try:
+        while True:
+            time.sleep(60)
+    except KeyboardInterrupt:
+        print("\n🛑 Shutdown requested. Monarch bots stopping gracefully.")
+──────────────────────────── File: run_bots.ps1 ────────────────────────────
+# run_bots.ps1 – PowerShell script to launch all Monarch bots at once
+
+Start-Process python -ArgumentList "-m bots.trend"
+Start-Process python -ArgumentList "-m bots.breakout"
+Start-Process python -ArgumentList "-m bots.meanreversion"
+Start-Process python -ArgumentList "-m bots.wick"
+──────────────────────────── File: utils/base_bot.py ────────────────────────────import time
+import json
+import os
+from datetime import datetime
+
+class BaseBot:
+    def __init__(self, name, signal_func, fetch_candles, place_trade):
+        self.name = name
+        self.signal_func = signal_func
+        self.fetch_candles = fetch_candles
+        self.place_trade = place_trade
+        self.stop_file = "stop_bots.json"
+        self.heartbeat_file = os.path.join("logs", "heartbeat.json")
+
+    def check_stop(self):
+        if os.path.exists(self.stop_file):
+            with open(self.stop_file, "r") as f:
+                try:
+                    data = json.load(f)
+                    return data.get("stop", False)
+                except:
+                    return False
+        return False
+
+    def update_heartbeat(self):
+        heartbeat = {"bot": self.name, "state": "trading", "timestamp": datetime.utcnow().isoformat()}
+        with open(self.heartbeat_file, "a") as f:
+            f.write(json.dumps(heartbeat) + "\n")
+
+    def run(self):
+        print(f"[{datetime.now()}] {self.name} Bot started.")
+        while True:
+            if self.check_stop():
+                print(f"[{datetime.now()}] halting {self.name} Bot")
+                break
+            candles = self.fetch_candles()
+            signal = self.signal_func(candles)
+            if signal:
+                trade_id = self.place_trade(signal)
+                print(f"[{datetime.now()}] {self.name} Bot placed trade {trade_id}")
+            self.update_heartbeat()
+            time.sleep(10)
+
+if __name__ == "__main__":
+    def dummy_signal(candles):
+        return None
+    def dummy_fetch():
+        return []
+    def dummy_place(sig):
+        return "DUMMY_TRADE_ID"
+    bot = BaseBot("example", dummy_signal, dummy_fetch, dummy_place)
+    bot.run()
+──────────────────────────── File: utils/config.py ────────────────────────────
+# Configuration for Trade Command Monarch
+
+# IG API Details (for demo spread betting on IG UK)
+IG_API_BASE_URL = "https://demo-api.ig.com/gateway/deal"
+IG_APP_KEY = "YOUR_IG_APP_KEY"
+IG_ACCOUNT_ID = "Z4NFPN"
+
+# Risk settings
+RISK_PCT = 0.01  # 1% risk per trade
+DEFAULT_BALANCE = 1000.0
+
+# ATR and indicator config
+ATR_PERIOD = 14
+ATR_MULTIPLIER_SL = 1.5
+ATR_MULTIPLIER_TP = 3.0
+
+# Confidence levels
+CONFIDENCE_MIN_MOMENTUM = 0.7
+CONFIDENCE_MIN_WICK = 0.7
+
+# Wick ratio for wick strategies
+WICK_RATIO = 1.5
+──────────────────────────── File: utils/indicators.py ────────────────────────────
+"""
+Technical Indicators – ATR, EMA, RSI, etc.
+"""
+
+import statistics
+from typing import List, Dict
+
+def _true_range(curr: Dict, prev_close: float) -> float:
+    return max(
+        curr["high"] - curr["low"],
+        abs(curr["high"] - prev_close),
+        abs(curr["low"] - prev_close),
+    )
+
+def atr_pips(market: str, lookback: int = 14) -> float:
+    from utils.data import fetch_candles
+    candles: List[Dict] = fetch_candles(market, num=lookback + 1)
+    if len(candles) < lookback + 1:
+        return 1.0
+    trs = []
+    for i in range(1, len(candles)):
+        tr = _true_range(candles[i], candles[i - 1]["close"])
+        trs.append(tr)
+    return round(statistics.mean(trs), 4) or 1.0
+
+def rsi(values: List[float], period: int = 14) -> float:
+    return 50.0
+
+def ema(values: List[float], period: int = 20) -> float:
+    return values[-1] if values else 0.0
+──────────────────────────── File: utils/journal.py ────────────────────────────
+import csv
+from datetime import datetime
+
+LOG_FILE = "trade_command_pro_log.csv"
+
+def log_trade(market, direction, sl, tp, confidence, strategy):
+    with open(LOG_FILE, 'a', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow([datetime.now(), market, direction, sl, tp, confidence, strategy])
+
+def trade_has_closed(deal_ref):
+    return True
+
+def get_trade_details(deal_ref):
+    return ("NAS100", "LONG", 1000.0, 1010.0, 50.0)
+
+def read_daily_pnl():
+    return "Daily P/L summary not implemented."
+──────────────────────────── File: utils/risk.py ────────────────────────────
+import math
+from typing import Dict
+from config import RISK_PCT, DEFAULT_BALANCE
+from utils.state import get_balance
+from utils.indicators import atr_pips
+
+def size_position(signal: Dict, market: str) -> float:
+    balance = get_balance() if callable(get_balance) else DEFAULT_BALANCE
+    stop_distance = abs(signal["entry"] - signal["sl"])
+    if stop_distance == 0:
+        return 0.0
+    risk_money = balance * RISK_PCT
+    size = risk_money / stop_distance
+    atr = atr_pips(market)
+    max_size = (balance * 0.05) / atr if atr else size
+    return round(min(size, max_size), 2)
+──────────────────────────── File: utils/execution.py ────────────────────────────
+import requests
+from config import IG_API_BASE_URL, IG_APP_KEY, IG_ACCOUNT_ID
+from utils.ig_auth import ig_login
+
+def place_trade(signal: dict) -> str:
+    tokens = ig_login()
+    headers = {
+        "X-IG-API-KEY": IG_APP_KEY,
+        "X-IG-ACCOUNT-ID": IG_ACCOUNT_ID,
+        "CST": tokens.get("CST", ""),
+        "X-SECURITY-TOKEN": tokens.get("X-SECURITY-TOKEN", ""),
+        "Accept": "application/json"
+    }
+    payload = {
+        "direction": signal["direction"],
+        "epic": signal.get("market", "UNKNOWN"),
+        "size": 1,
+        "orderType": "LIMIT",
+        "currencyCode": "GBP",
+        "expiry": "DFB",
+        "forceOpen": True,
+        "level": signal["entry"],
+        "stopLevel": signal["sl"],
+        "limitLevel": signal["tp"]
+    }
+    response = requests.post(f"{IG_API_BASE_URL}/positions", json=payload, headers=headers, timeout=10)
+    response.raise_for_status()
+    data = response.json()
+    return data.get("dealReference", "UNKNOWN_TRADE_ID")
+
+def place_ig_order(signal: dict) -> str:
+    return place_trade(signal)
+──────────────────────────── File: utils/trade_executor.py ────────────────────────────
+import requests
+from config import IG_API_BASE_URL, IG_APP_KEY, IG_ACCOUNT_ID
+from utils.ig_auth import ig_login
+
+def get_live_ig_balance() -> float:
+    tokens = ig_login()
+    headers = {
+        "X-IG-API-KEY": IG_APP_KEY,
+        "X-IG-ACCOUNT-ID": IG_ACCOUNT_ID,
+        "CST": tokens.get("CST", ""),
+        "X-SECURITY-TOKEN": tokens.get("X-SECURITY-TOKEN", ""),
+        "Accept": "application/json"
+    }
+    response = requests.get(f"{IG_API_BASE_URL}/accounts", headers=headers, timeout=10)
+    response.raise_for_status()
+    data = response.json()
+    accounts = data.get("accounts")
+    if not accounts:
+        raise ValueError("No accounts found in response")
+    for account in accounts:
+        if account.get("accountId") == "Z4NFPN":
+            balance = account.get("accountInfo", {}).get("balance")
+            if balance is None:
+                raise ValueError("Balance field not found")
+            return float(balance)
+    balance = accounts[0].get("accountInfo", {}).get("balance")
+    if balance is None:
+        raise ValueError("Balance field not found")
+    return float(balance)
+──────────────────────────── File: utils/data.py ────────────────────────────
+def fetch_candles(market="dummy", num=50):
+    from datetime import datetime, timedelta
+    candles = []
+    base_price = 1.1000
+    for i in range(num):
+        candle = {
+            "open": base_price,
+            "high": base_price + 0.0010,
+            "low": base_price - 0.0010,
+            "close": base_price + (0.0005 if i % 2 == 0 else -0.0005),
+            "volume": 1000,
+            "time": (datetime.now() - timedelta(minutes=num - i)).isoformat(),
+            "market": market
+        }
+        candles.append(candle)
+        base_price += 0.0001
+    return candles
+──────────────────────────── File: utils/data_fetcher.py ────────────────────────────
+import requests
+
+def get_session():
+    session = requests.Session()
+    return session
+──────────────────────────── File: utils/stream_fetcher.py ────────────────────────────
+import threading
+import time
+from datetime import datetime, timedelta
+from collections import deque, defaultdict
+from lightstreamer.client import LightstreamerClient, Subscription
+
+_tick_buffers = defaultdict(lambda: deque())
+_bar_buffers = defaultdict(lambda: defaultdict(lambda: deque(maxlen=100)))
+_lock = threading.Lock()
+
+def _on_item_update(item_update):
+    epic = item_update.getItemName()
+    price = float(item_update.getValue("LTP") or 0)
+    ts = datetime.utcnow()
+    with _lock:
+        _tick_buffers[epic].append((ts, price))
+
+def start_streaming(api_key, cst, token, epics):
+    client = LightstreamerClient("https://pushlightstream-demo.ig.com", "QUOTE_ADAPTER")
+    client.connectionDetails.httpExtraHeaders = {
+        "X-IG-API-KEY": api_key,
+        "CST": cst,
+        "X-SECURITY-TOKEN": token
+    }
+    client.connect()
+    sub = Subscription("MERGE", epics, ["LTP"])
+    sub.setDataAdapter("QUOTE_ADAPTER")
+    sub.setRequestedSnapshot("no")
+    sub.addListener(_on_item_update)
+    client.subscribe(sub)
+    threading.Thread(target=_aggregate_bars, args=(epics,), daemon=True).start()
+
+def _aggregate_bars(epics):
+    while True:
+        now = datetime.utcnow()
+        next_bound = (now + timedelta(minutes=5)).replace(second=0, microsecond=0)
+        time.sleep((next_bound - now).total_seconds())
+        with _lock:
+            for epic in epics:
+                ticks = list(_tick_buffers[epic])
+                _tick_buffers[epic].clear()
+                if not ticks:
+                    continue
+                prices = [p for _, p in ticks]
+                bar = {
+                    "timestamp": next_bound.isoformat(),
+                    "open": prices[0],
+                    "high": max(prices),
+                    "low": min(prices),
+                    "close": prices[-1],
+                    "volume": len(prices)
+                }
+                _bar_buffers[epic]["5MINUTE"].append(bar)
+
+def get_stream_bars(epic, resolution):
+    if resolution != "5MINUTE":
+        return []
+    with _lock:
+        return list(_bar_buffers[epic].get("5MINUTE", []))
+
+──────────────────────────── File: utils/structure.py ────────────────────────────
+def detect_swing_breaks(candles):
+    signals = []
+    for i in range(3, len(candles)):
+        prev3  = candles[i-3:i]
+        highs  = [c["high"] for c in prev3]
+        lows   = [c["low"]  for c in prev3]
+        current = candles[i]
+        if highs[0] < highs[1] < highs[2] and current["close"] > highs[2]:
+            signals.append({
+                "direction": "buy",
+                "price": current["close"],
+                "ATR": current.get("ATR", 0),
+                "breakout": True,
+                "volume": current.get("volume", 0),
+                "avg_volume": current.get("avg_volume", 0),
+                "ema_distance": current.get("ema_distance", 0),
+                "session": current.get("session", "")
+            })
+        if lows[0] > lows[1] > lows[2] and current["close"] < lows[2]:
+            signals.append({
+                "direction": "sell",
+                "price": current["close"],
+                "ATR": current.get("ATR", 0),
+                "breakout": True,
+                "volume": current.get("volume", 0),
+                "avg_volume": current.get("avg_volume", 0),
+                "ema_distance": current.get("ema_distance", 0),
+                "session": current.get("session", "")
+            })
+    return signals
+
+def detect_wick_rejections(candles):
+    signals = []
+    for c in candles:
+        body = abs(c["close"] - c["open"])
+        if c["close"] < c["open"]:
+            wick = max(c["high"] - c["close"], c["high"] - c["open"])
+        else:
+            wick = max(c["open"] - c["low"], c["close"] - c["low"])
+        atr = c.get("ATR", 1)
+        if wick >= 1.5 * atr and body <= 0.3 * atr:
+            signals.append({
+                "direction": "sell" if c["close"] < c["open"] else "buy",
+                "price": c["close"],
+                "ATR": atr,
+                "wick_ratio": wick / body if body > 0 else float("inf"),
+                "body_size": body,
+                "wick_size": wick,
+                "volume": c.get("volume", 0),
+                "avg_volume": c.get("avg_volume", 0),
+                "ema_distance": c.get("ema_distance", 0),
+                "trend_state": c.get("trend_state", ""),
+                "session": c.get("session", "")
+            })
+    return signals
+
+def confirm_structure(candles, signal):
+    if len(candles) < 2:
+        return True
+    last_close = candles[-1]["close"]
+    prev_close = candles[-2]["close"]
+    if signal.get("direction") == "buy":
+        return last_close > prev_close
+    else:
+        return last_close < prev_close
+──────────────────────────── File: utils/trailing_stop.py ────────────────────────────
+import threading
+import time
+from utils.data_fetcher import get_session
+from config import IG_API_BASE_URL
+
+def monitor_position(deal_ref, epic, direction, atr, initial_sl):
+    sl = initial_sl
+    while True:
+        time.sleep(30)
+        session = get_session()
+        try:
+            resp = session.get(
+                f"{IG_API_BASE_URL}/prices/{epic}/HISTORICAL/1MINUTE",
+                params={"max": 1},
+                timeout=10
+            )
+            resp.raise_for_status()
+            data = resp.json().get("prices", []) or resp.json().get("candles", [])
+            if not data:
+                continue
+            last_price = data[-1]["close"]
+        except Exception:
+            continue
+        new_sl = (last_price - atr) if direction == "buy" else (last_price + atr)
+        if direction == "buy" and new_sl > sl:
+            payload = {"dealReference": deal_ref, "stopLevel": new_sl}
+            session.put(f"{IG_API_BASE_URL}/positions/{deal_ref}", json=payload)
+            sl = new_sl
+        elif direction == "sell" and new_sl < sl:
+            payload = {"dealReference": deal_ref, "stopLevel": new_sl}
+            session.put(f"{IG_API_BASE_URL}/positions/{deal_ref}", json=payload)
+            sl = new_sl
+──────────────────────────── File: launcher.py ────────────────────────────
+# launcher.py – Unified Launcher for Monarch Bot Suite
+
+import threading
+import time
+from bots.trend import BaseBot as TrendBot, trend_signal
+from bots.breakout import BaseBot as BreakoutBot, breakout_signal
+from bots.meanreversion import BaseBot as MeanRevBot, meanreversion_signal
+from bots.wick import BaseBot as WickBot, wick_signal
+from utils.data import fetch_candles
+from utils.execution import place_trade
+
+def launch_bot(bot_class, name, signal_func):
+    bot = bot_class(
+        name=name,
+        signal_func=signal_func,
+        fetch_candles=fetch_candles,
+        place_trade=place_trade
+    )
+    bot.run()
+
+if __name__ == "__main__":
+    threads = []
+    bot_configs = [
+        ("trend", TrendBot, trend_signal),
+        ("breakout", BreakoutBot, breakout_signal),
+        ("meanreversion", MeanRevBot, meanreversion_signal),
+        ("wick", WickBot, wick_signal)
+    ]
+    print("🚀 Launching Monarch bots...\n")
+    for name, bot_class, signal_func in bot_configs:
+        t = threading.Thread(target=launch_bot, args=(bot_class, name, signal_func), daemon=True)
+        t.start()
+        threads.append(t)
+        print(f"✅ Started: {name.capitalize()} bot")
+    try:
+        while True:
+            time.sleep(60)
+    except KeyboardInterrupt:
+        print("\n🛑 Shutdown requested. Monarch bots stopping gracefully.")
+──────────────────────────── File: dashboard.py ────────────────────────────
+# dashboard.py – v1.2-tzfix
+import json, os, time, warnings
+from datetime import datetime, timedelta, UTC
+
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+import pandas as pd
+import streamlit as st
+from streamlit_autorefresh import st_autorefresh
+
+from utils.emailer        import send_bot_online_email, send_bot_offline_email
+from utils.trade_executor import get_live_ig_balance
+from utils.file_utils     import atomic_write_json
+
+# ───────────────────────────── paths ─────────────────────────────
+STOP_FILE        = "stop_bots.json"
+CONFIDENCE_FILE  = "confidence.json"
+HEARTBEAT_FILE   = "logs/heartbeat.json"
+TRADE_LOG_FILE   = "logs/trade_log.json"
+BALANCE_FILE     = "logs/balance.json"
+
+# ───────────────────────── stats helper ──────────────────────────
+def calc_stats(df: pd.DataFrame) -> dict:
+    if df.empty or "profit" not in df.columns:
+        return {}
+
+    # Parse to datetime, then STRIP any timezone to keep comparisons naïve
+    df["exit_time"] = (
+        pd.to_datetime(df["exit_time"], errors="coerce")
+          .dt.tz_localize(None)          # make tz-naïve
+    )
+
+    now     = datetime.now(UTC).replace(tzinfo=None)  # tz-naïve “now”
+    weekcut = now - timedelta(days=7)
+
+    total    = df["profit"].sum()
+    pnl_day  = df.loc[df["exit_time"].dt.date == now.date(), "profit"].sum()
+    pnl_week = df.loc[df["exit_time"] >= weekcut, "profit"].sum()
+
+    win_rate = (df["profit"] > 0).mean() * 100
+    daily    = df.groupby(df["exit_time"].dt.date)["profit"].sum()
+    sharpe   = ((daily.mean() / daily.std(ddof=0)) * 252**0.5) if daily.std(ddof=0) else 0
+
+    equity = df["profit"].cumsum()
+    max_dd = abs((equity - equity.cummax()).min())
+
+    return dict(total=total, day=pnl_day, week=pnl_week,
+                win=win_rate, sharpe=sharpe, mdd=max_dd)
+
+# ───────────────────────── file helpers ──────────────────────────
+def set_stop_flag(val: bool):
+    atomic_write_json({"stop": val}, STOP_FILE)
+    send_bot_offline_email() if val else send_bot_online_email()
+
+def get_stop_flag() -> bool:
+    if not os.path.exists(STOP_FILE):
+        return False
+    return json.load(open(STOP_FILE)).get("stop", False)
+
+def set_confidence(val: int):
+    atomic_write_json({"confidence": val}, CONFIDENCE_FILE)
+
+def get_confidence() -> int:
+    if not os.path.exists(CONFIDENCE_FILE):
+        set_confidence(85)
+    return json.load(open(CONFIDENCE_FILE)).get("confidence", 85)
+
+def get_heartbeat() -> dict:
+    if not os.path.exists(HEARTBEAT_FILE):
+        return {}
+    try:
+        return json.load(open(HEARTBEAT_FILE))
+    except Exception:
+        return {}
+
+def get_trade_log() -> pd.DataFrame:
+    if not os.path.exists(TRADE_LOG_FILE):
+        return pd.DataFrame()
+    lines = [json.loads(l) for l in open(TRADE_LOG_FILE) if l.strip()]
+    return pd.DataFrame(lines) if lines else pd.DataFrame()
+
+def get_balance_history():
+    if not os.path.exists(BALANCE_FILE):
+        return None
+    try:
+        return json.load(open(BALANCE_FILE))
+    except Exception:
+        return None
+
+# ───────────────────────── Streamlit cfg ─────────────────────────
+st.set_page_config(page_title="Trade Command Monarch",
+                   page_icon=":robot_face:",
+                   layout="wide",
+                   initial_sidebar_state="expanded")
+st_autorefresh(interval=3_000, limit=None, key="dash_refresh")
+
+st.markdown("""
+<style>
+body            { background:#181a20; color:#f1f1f1; }
+.stButton>button{ border-radius:16px; font-weight:bold; }
+.stMetric-value { color:#44d9e6 !important; }
+.block-container{ padding-top:2rem; }
+</style>
+""", unsafe_allow_html=True)
+
+# ───────────────────────── sidebar ───────────────────────────────
+st.sidebar.title("⚙️ Settings")
+
+if "slider_conf" not in st.session_state:
+    st.session_state.slider_conf = get_confidence()
+if "conf_updated_at" not in st.session_state:
+    st.session_state.conf_updated_at = 0.0
+
+def _update_conf():
+    set_confidence(st.session_state.slider_conf)
+    st.session_state.conf_updated_at = time.time()
+
+st.sidebar.slider("Global Confidence % to Take Trade",
+                  50, 100, st.session_state.slider_conf, 1,
+                  key="slider_conf", on_change=_update_conf)
+
+if time.time() - st.session_state.conf_updated_at < 2:
+    st.sidebar.success(f"Confidence set to {st.session_state.slider_conf}%")
+
+allow_anytime = st.sidebar.toggle("⚡ Allow Bots To Trade Outside Market Hours",
+                                  value=False)
+
+if st.sidebar.button("🔄 Refresh Now"):
+    st.experimental_rerun()
+
+# ───────────────────────── top metrics ───────────────────────────
+st.title("💎 Trade Command Monarch Dashboard")
+
+try:
+    live_balance = get_live_ig_balance()
+except Exception as e:
+    st.error(f"Balance error: {e}")
+    live_balance = 0.0
+
+df_trades = get_trade_log()
+stats     = calc_stats(df_trades)
+
+bal_col, pnl_col = st.columns(2)
+bal_col.metric("Account Balance", f"£{live_balance:,.2f}")
+pnl_col.metric("Total P & L",     f"£{stats.get('total',0):,.2f}")
+
+if stats:
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("P & L Today",  f"£{stats['day']:,.2f}")
+    c2.metric("P & L Week",   f"£{stats['week']:,.2f}")
+    c3.metric("Win-Rate",      f"{stats['win']:.1f}%")
+    c4.metric("Sharpe",        f"{stats['sharpe']:.2f}")
+    st.caption(f"Max Drawdown: £{stats['mdd']:,.2f}")
+
+st.divider()
+
+# ───────────────────────── controls ──────────────────────────────
+st.header("🔧 Controls")
+bots_running = not get_stop_flag()
+start_col, stop_col = st.columns(2)
+start_col.button("🟢 Start All Bots", disabled=bots_running,
+                 on_click=lambda: set_stop_flag(False))
+stop_col.button("🔴 Stop All Bots",  disabled=not bots_running,
+                on_click=lambda: set_stop_flag(True))
+st.info("Bots read 'confidence.json' and 'stop_bots.json' every loop.")
+
+# ───────────────────────── bot status ────────────────────────────
+st.divider()
+st.header("🤖 Bot Status")
+
+heartbeat = get_heartbeat()
+bot_names = sorted([k.capitalize() for k in heartbeat.get("bots", heartbeat).keys()]) \
+            or ["Momentum","Wick","Trend","Breakout"]
+
+cols = st.columns(len(bot_names))
+now  = datetime.now(UTC)
+
+for i, bot in enumerate(bot_names):
+    hb = heartbeat.get(bot.lower(), {})
+    ts = hb.get("timestamp")
+    if ts:
+        last_dt     = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+        minutes     = (now - last_dt).total_seconds() / 60
+        status      = "🟢 Online" if minutes < 5 else "🟡 Stale"
+        delta       = f"{minutes:.1f} min ago"
+        details     = hb.get("state","")
+    else:
+        status, delta, details = "🔴 Offline", "—", ""
+    with cols[i]:
+        st.metric(f"{bot} Bot", status, delta)
+        if details:
+            st.caption(f"State: {details}")
+
+# ───────────────────────── trade log ─────────────────────────────
+st.divider()
+st.header("📊 Trade Log")
+
+if df_trades.empty:
+    st.info("No trades yet.")
+else:
+    show_cols = [c for c in [
+        "bot","market","direction","entry","exit","profit",
+        "confidence","reason","entry_time","exit_time","balance"
+    ] if c in df_trades.columns]
+
+    view = df_trades.sort_values("entry_time", ascending=False).head(30)[show_cols]
+    st.dataframe(view, use_container_width=True, hide_index=True, height=500)
+
+    if {"balance","exit_time"}.issubset(df_trades.columns):
+        plot = df_trades[["exit_time","balance"]].dropna()
+        plot["exit_time"] = pd.to_datetime(plot["exit_time"])
+        st.line_chart(plot.set_index("exit_time").sort_index()["balance"].ffill(),
+                      use_container_width=True)
+
+# ───────────────────────── session footer ───────────────────────
+st.divider()
+st.header("🕒 Session Status")
+st.success("Bots are RUNNING") if bots_running else st.error("Bots are STOPPED")
+
+st.divider()
+st.caption("Trade Command Monarch — Automated Trading Control Dashboard © 2025")
