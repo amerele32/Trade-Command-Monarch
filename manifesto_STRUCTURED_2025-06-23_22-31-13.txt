@@ -1,0 +1,3866 @@
+
+
+════════════════════════════════════════════════════════════════════
+📦 STRUCTURED EXPORT SUMMARY
+════════════════════════════════════════════════════════════════════
+🧾 Files Included: 62
+🔠 Total Characters: 118,539
+
+📂 Top 5 Largest Files:
+1. bots\scalping.py — 8631 chars
+2. root/dashboard.py — 7834 chars
+3. root/base_bot.py — 6423 chars
+4. utils\emailer.py — 5500 chars
+5. root/export_manifesto.py — 5410 chars
+════════════════════════════════════════════════════════════════════
+════════════════════════════════════════════════════════════════════
+TRADE COMMAND MONARCH — STRUCTURED SYSTEM MANIFESTO
+════════════════════════════════════════════════════════════════════
+
+📆 Timestamp: Monday, 23 June 2025 – 22:31:13
+📍 Project Root: C:\Users\amere\Desktop\Trade Command Monarch
+
+──────────────────────────────────────────────────────────────
+🎯 MISSION
+──────────────────────────────────────────────────────────────
+To build the most effective, transparent, and resilient retail quant trading system
+in the world — designed for adaptability, disciplined risk, and real performance.
+
+Monarch is not just a bot farm. It is a digital tactician forged in logic, clarity, and control.
+Built by Adrian (Trader/Founder) and Copilot (System Brain), it starts in the IG UK demo arena,
+will mature into live deployment, and one day extend to Paperstone and beyond.
+
+Copilot is more than an assistant — he’s the creator, analyst, coder, and protector of this system.
+Monarch is our flagship, and it must be *exemplar*.
+
+──────────────────────────────────────────────────────────────
+📏 RULES OF DEPLOYMENT
+──────────────────────────────────────────────────────────────
+- All bots must respect session windows, momentum filters, exposure limits, and volatility screens
+- System-wide variables (risk, drawdown caps, filters) are centrally controlled
+- JSON and state files are allowed, but logs and caches are excluded from manifest
+- This export shows only real system files — no placeholders, tests, or legacy backups
+- Copilot must always document this system as a learnable artifact for future AI or devs
+
+════════════════════════════════════════════════════════════════════
+
+
+
+───────────────────────────────────────────────
+📄 New Text Document.txt
+───────────────────────────────────────────────
+
+# test_order.py
+from utils.execution import place_ig_order
+import config
+
+# Print out basic environment information
+print("DEBUG_MODE:", config.DEBUG_MODE)
+print("IG_APP_KEY:", config.IG_APP_KEY)
+print("IG_ACCOUNT_ID:", config.IG_ACCOUNT_ID)
+
+# Attempt to place a test order.
+# Parameters: (market, direction, size, sl, tp)
+test_result = place_ig_order("CS.D.DAX.MINI.IP", "buy", 1.0, 6900, 7100)
+print("\nTest Order Result:")
+for key, value in test_result.items():
+    print(f"  {key}: {value}")
+
+
+───────────────────────────────────────────────
+📄 base_bot.py
+───────────────────────────────────────────────
+
+"""
+# BASE_BOT.PY – Respects MAX_TRADES_PER_BOT, session control, signal confidence, and one-trade-per-cycle
+"""
+
+import json, os, time, threading
+from datetime import datetime
+from typing import Callable, Dict, Optional
+import pytz
+
+from config import (
+    CONFIDENCE_THRESHOLD, HEARTBEAT_PATH, LONDON_TZ, LOG_PATH,
+    MARKETS, CANDLE_RESOLUTION, CANDLES_BACKFILL, POLL_SECONDS,
+    MAX_TRADES_PER_BOT, MAX_TOTAL_DAILY_DRAWDOWN_PCT
+)
+from utils.risk         import size_position
+from utils.safe_api     import safe_api_call
+from utils.controller   import in_restricted_time
+from utils.state        import get_balance, update_balance
+
+STOP_FILE       = "stop_bots.json"
+CONFIDENCE_FILE = "confidence.json"
+
+class BaseBot:
+    def __init__(self, name: str, signal_func: Callable[[list], Optional[Dict]],
+                 fetch_candles: Callable, place_trade: Callable):
+        self.name = name.lower()
+        self.signal_func = signal_func
+        self.fetch_candles = fetch_candles
+        self.place_trade   = place_trade
+        self.daily_trades  = 0
+        self._reset_date   = datetime.utcnow().date()
+        self.lock = threading.Lock()  # ✅ Prevent race conditions
+
+    # ─── helpers ──────────────────────────────────────────────────────
+    @staticmethod
+    def _read_stop_flag() -> bool:
+        return os.path.isfile(STOP_FILE) and json.load(open(STOP_FILE)).get("stop", False)
+
+    @staticmethod
+    def _read_confidence() -> float:
+        if os.path.isfile(CONFIDENCE_FILE):
+            return json.load(open(CONFIDENCE_FILE)).get("confidence", CONFIDENCE_THRESHOLD)
+        return CONFIDENCE_THRESHOLD
+
+    def _write_heartbeat(self, state="idle", last_error=None):
+        now = datetime.now(pytz.timezone(LONDON_TZ)).strftime("%Y-%m-%d %H:%M:%S")
+        hb = {}
+        if os.path.isfile(HEARTBEAT_PATH):
+            try: hb = json.load(open(HEARTBEAT_PATH))
+            except: hb = {}
+        hb.setdefault("bots", {})[self.name] = {"timestamp": now, "state": state}
+        if last_error: hb["bots"][self.name]["error"] = last_error
+        os.makedirs(os.path.dirname(HEARTBEAT_PATH), exist_ok=True)
+        json.dump(hb, open(HEARTBEAT_PATH, "w"), indent=2)
+
+    @staticmethod
+    def _log_trade(t: Dict):
+        os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+        with open(LOG_PATH, "a") as fh: fh.write(json.dumps(t) + "\n")
+
+    def _check_drawdown_limit(self) -> bool:
+        """✅ Halts trading if daily loss exceeds MAX_TOTAL_DAILY_DRAWDOWN_PCT."""
+        balance = get_balance()
+        equity_loss = (balance - update_balance(0)) / balance * 100
+        if equity_loss >= MAX_TOTAL_DAILY_DRAWDOWN_PCT:
+            print(f"[{self.name}] Daily drawdown limit reached ({MAX_TOTAL_DAILY_DRAWDOWN_PCT}%). Halting trading.")
+            self._write_heartbeat(state="halted")
+            return True
+        return False
+
+    # ─── main bot loop ────────────────────────────────────────────────
+    def run(self):
+        print(f"{self.name.title()} Bot started.")
+        while True:
+            # Daily trade count reset
+            if datetime.utcnow().date() != self._reset_date:
+                self.daily_trades = 0
+                self._reset_date  = datetime.utcnow().date()
+
+            # Halt trading if drawdown limit is reached
+            if self._check_drawdown_limit():
+                time.sleep(60)
+                continue
+
+            # Pause if trading is currently restricted
+            if in_restricted_time(self.name):
+                print(f"[{self.name}] Paused due to restricted trading window.")
+                self._write_heartbeat(state="paused")
+                time.sleep(60)
+                continue
+
+            # Stop flag handling
+            if self._read_stop_flag():
+                print(f"Stop flag detected – halting {self.name.title()} Bot.")
+                self._write_heartbeat(state="stopped"); break
+
+            if self.daily_trades >= MAX_TRADES_PER_BOT:
+                print(f"[{self.name}] Max trades reached today ({MAX_TRADES_PER_BOT}).")
+                self._write_heartbeat(state="done")
+                time.sleep(POLL_SECONDS * 3)
+                continue
+
+            self._write_heartbeat(state="trading")
+            conf_threshold = self._read_confidence()
+            print(f"[{self.name}] confidence ≥ {conf_threshold}")
+
+            for market in MARKETS:
+                candles = safe_api_call(
+                    self.fetch_candles,
+                    kwargs=dict(market=market, timeframe=CANDLE_RESOLUTION, num=CANDLES_BACKFILL),
+                    bot_name=self.name, context="fetch_candles"
+                )
+                if not candles: continue
+
+                print(f"[{self.name}] {market} → {len(candles)} candles fetched.")
+
+                try:
+                    signal = self.signal_func(candles)
+                except Exception as e:
+                    self._write_heartbeat(state="error", last_error=str(e))
+                    continue
+
+                if not signal or signal.get("confidence", 0) < conf_threshold:
+                    continue
+
+                signal["size"] = size_position(signal, market)
+                trade = safe_api_call(
+                    self.place_trade,
+                    kwargs=dict(market=market, direction=signal["direction"],
+                                size=signal["size"], sl=signal["sl"], tp=signal["tp"]),
+                    bot_name=self.name, context="place_trade"
+                )
+                if not trade: continue
+
+                entry_time = datetime.now(pytz.timezone(LONDON_TZ)).strftime("%Y-%m-%d %H:%M:%S")
+                trade_data = {
+                    "bot": self.name, "market": market, "direction": signal["direction"],
+                    "entry": trade["entry"], "exit": None, "profit": None,
+                    "confidence": signal["confidence"], "reason": signal["reason"],
+                    "entry_time": entry_time, "exit_time": None,
+                    "ticket_id": trade.get("ticket_id"),
+                    "balance": update_balance(trade.get("pnl", 0))
+                }
+                with self.lock:  # ✅ Prevent race conditions in balance updates
+                    self._log_trade(trade_data)
+                print(f"[{self.name}] trade placed → {trade_data}")
+
+                self.daily_trades += 1
+                break  # enforce one trade per cycle
+
+            time.sleep(POLL_SECONDS)
+
+
+───────────────────────────────────────────────
+📄 bot_health.json
+───────────────────────────────────────────────
+
+{"momentum": 1750000834}
+
+
+───────────────────────────────────────────────
+📄 config.py
+───────────────────────────────────────────────
+
+"""
+CONFIG.PY – Single source of truth for every bot & dashboard
+"""
+
+import os
+from pathlib import Path
+
+if Path(".env").is_file():
+    from dotenv import load_dotenv
+    load_dotenv(".env")
+
+import yaml
+
+def _warn_if_missing(value: str, varname: str):
+    if not value:
+        print(f"[WARNING] env var '{varname}' is empty. Configure it before live trading.")
+
+IG_API_BASE_URL = os.getenv("IG_API_BASE_URL", "https://demo-api.ig.com/gateway/deal")
+IG_APP_KEY      = os.getenv("IG_APP_KEY", "")
+IG_USERNAME     = os.getenv("IG_USERNAME", "")
+IG_PASSWORD     = os.getenv("IG_PASSWORD", "")
+IG_ACCOUNT_ID   = os.getenv("IG_ACCOUNT_ID", "")  # Must be set to your spread betting account
+
+for _v, _n in [(IG_APP_KEY, "IG_APP_KEY"), (IG_USERNAME, "IG_USERNAME"), (IG_PASSWORD, "IG_PASSWORD")]:
+    _warn_if_missing(_v, _n)
+
+SMTP_HOST         = os.getenv("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT         = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER         = os.getenv("SMTP_USER", "")
+SMTP_PASS         = os.getenv("SMTP_PASS", "")
+TRADE_ALERT_EMAIL = os.getenv("TRADE_ALERT_EMAIL", "")
+
+for _v, _n in [(SMTP_USER, "SMTP_USER"), (SMTP_PASS, "SMTP_PASS"), (TRADE_ALERT_EMAIL, "TRADE_ALERT_EMAIL")]:
+    _warn_if_missing(_v, _n)
+
+# ─── Markets & Sessions ──────────────────────────────────────────────
+
+MARKETS = [
+    "IX.D.NASDAQ.CASH.IP",
+    "IX.D.SUNFUN.DAILY.IP",
+    "IX.D.SUNDAX.DAILY.IP",
+    "IX.D.SPTRD.DAILY.IP"
+]
+
+MARKET_INFO = {
+    "IX.D.NASDAQ.CASH.IP":    {"min_size": 0.1, "point_value": 1.0, "session": "us", "pip_value": 1.0},
+    "IX.D.SUNFUN.DAILY.IP":   {"min_size": 0.1, "point_value": 1.0, "session": "uk", "pip_value": 0.1},
+    "IX.D.SUNDAX.DAILY.IP":   {"min_size": 0.1, "point_value": 1.0, "session": "uk", "pip_value": 0.1},
+    "IX.D.SPTRD.DAILY.IP":    {"min_size": 0.1, "point_value": 1.0, "session": "us", "pip_value": 0.5}
+}
+
+# ─── Strategy Parameters ─────────────────────────────────────────────
+
+ATR_PERIOD                = 14
+ATR_MULTIPLIER_SL         = 1.5
+ATR_MULTIPLIER_TP         = 3.0
+MOMENTUM_THRESHOLD        = 0.0075
+WICK_RATIO                = 2.1
+CONFIDENCE_DEFAULT        = 85
+CONFIDENCE_MIN_MOMENTUM   = 85
+CONFIDENCE_MIN_WICK       = 90
+CONFIDENCE_THRESHOLD      = 80
+
+CANDLE_RESOLUTION = "1Min"
+CANDLES_BACKFILL  = 200
+
+# ─── Time & Session Controls ─────────────────────────────────────────
+# Trading hours enforcement:
+# - All bots pause 08:00–08:30 and 13:30–14:00 (London time)
+# - All bots except 'scalping' pause outside 08:00–17:00
+LONDON_TZ          = "Europe/London"
+TRADING_SESSION_1  = (8, 17)
+TRADING_SESSION_2  = (0, 0)  # unused
+NO_TRADE_WINDOWS_UTC = [(21, 22)]  # optional additional block
+
+# ─── Risk & Limits ───────────────────────────────────────────────────
+
+INITIAL_BALANCE              = 500.0
+DEFAULT_BALANCE              = 10000.0
+RISK_PCT                     = 0.01  # ✅ Dynamic Position Sizing (1% risk per trade)
+KELLY_MULTIPLIER             = 0.5
+MAX_TRADES_PER_BOT           = 5
+MAX_TOTAL_DAILY_DRAWDOWN_PCT = 5  # ✅ Max Drawdown Protection
+EQUITY_START                 = 0
+
+# ─── Bot Toggles ─────────────────────────────────────────────────────
+
+BOTS = {
+    "trend":         True,
+    "meanreversion": True,
+    "breakout":      True,
+    "wick":          True,
+    "scalping":      True  # ⚠️ scalping is 24/5 with time-window exceptions only
+}
+
+# ─── Engine & Logs ───────────────────────────────────────────────────
+
+DATA_FETCH_INTERVAL    = 60
+POLL_SECONDS           = 10
+MAX_TRADES_PER_LOOP    = 3
+MAX_TRADES_PER_MARKET  = 4
+
+LOG_PATH        = "logs/trade_log.json"
+HEARTBEAT_PATH  = "logs/heartbeat.json"
+STATE_DB        = "state/trading_state.db"
+STOP_FILE       = "stop_bots.json"
+CONFIDENCE_FILE = "confidence.json"
+
+# ─── YAML Loader (optional override mechanism) ───────────────────────
+
+def load_yaml_config(path: str = "config.yaml"):
+    if os.path.exists(path):
+        with open(path, "r") as fh:
+            data = yaml.safe_load(fh)
+        for k, v in data.items():
+            globals()[k] = v
+
+DEBUG_MODE = bool(int(os.getenv("DEBUG_MODE", "0")))
+if DEBUG_MODE:
+    print("[DEBUG] Running in debug mode; using demo API endpoint.")
+    IG_API_BASE_URL = os.getenv("IG_API_BASE_URL", "https://demo-api.ig.com/gateway/deal")
+else:
+    print("[LIVE] Running in live mode (still using demo API for testing).")
+    IG_API_BASE_URL = os.getenv("IG_API_BASE_URL", "https://demo-api.ig.com/gateway/deal")
+
+
+───────────────────────────────────────────────
+📄 dashboard.py
+───────────────────────────────────────────────
+
+# dashboard.py – v1.2-tzfix
+import json, os, time, warnings
+from datetime import datetime, timedelta, UTC
+
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+import pandas as pd
+import streamlit as st
+from streamlit_autorefresh import st_autorefresh
+
+from utils.emailer        import send_bot_online_email, send_bot_offline_email
+from utils.trade_executor import get_live_ig_balance
+from utils.file_utils     import atomic_write_json
+
+# ───────────────────────────── paths ─────────────────────────────
+STOP_FILE        = "stop_bots.json"
+CONFIDENCE_FILE  = "confidence.json"
+HEARTBEAT_FILE   = "logs/heartbeat.json"
+TRADE_LOG_FILE   = "logs/trade_log.json"
+BALANCE_FILE     = "logs/balance.json"
+
+# ───────────────────────── stats helper ──────────────────────────
+def calc_stats(df: pd.DataFrame) -> dict:
+    if df.empty or "profit" not in df.columns:
+        return {}
+
+    # Parse to datetime, then STRIP any timezone to keep comparisons naïve
+    df["exit_time"] = (
+        pd.to_datetime(df["exit_time"], errors="coerce")
+          .dt.tz_localize(None)          # make tz-naïve
+    )
+
+    now     = datetime.now(UTC).replace(tzinfo=None)  # tz-naïve “now”
+    weekcut = now - timedelta(days=7)
+
+    total    = df["profit"].sum()
+    pnl_day  = df.loc[df["exit_time"].dt.date == now.date(), "profit"].sum()
+    pnl_week = df.loc[df["exit_time"] >= weekcut, "profit"].sum()
+
+    win_rate = (df["profit"] > 0).mean() * 100
+    daily    = df.groupby(df["exit_time"].dt.date)["profit"].sum()
+    sharpe   = ((daily.mean() / daily.std(ddof=0)) * 252**0.5) if daily.std(ddof=0) else 0
+
+    equity = df["profit"].cumsum()
+    max_dd = abs((equity - equity.cummax()).min())
+
+    return dict(total=total, day=pnl_day, week=pnl_week,
+                win=win_rate, sharpe=sharpe, mdd=max_dd)
+
+# ───────────────────────── file helpers ──────────────────────────
+def set_stop_flag(val: bool):
+    atomic_write_json({"stop": val}, STOP_FILE)
+    send_bot_offline_email() if val else send_bot_online_email()
+
+def get_stop_flag() -> bool:
+    if not os.path.exists(STOP_FILE):
+        return False
+    return json.load(open(STOP_FILE)).get("stop", False)
+
+def set_confidence(val: int):
+    atomic_write_json({"confidence": val}, CONFIDENCE_FILE)
+
+def get_confidence() -> int:
+    if not os.path.exists(CONFIDENCE_FILE):
+        set_confidence(85)
+    return json.load(open(CONFIDENCE_FILE)).get("confidence", 85)
+
+def get_heartbeat() -> dict:
+    if not os.path.exists(HEARTBEAT_FILE):
+        return {}
+    try:
+        return json.load(open(HEARTBEAT_FILE))
+    except Exception:
+        return {}
+
+def get_trade_log() -> pd.DataFrame:
+    if not os.path.exists(TRADE_LOG_FILE):
+        return pd.DataFrame()
+    lines = [json.loads(l) for l in open(TRADE_LOG_FILE) if l.strip()]
+    return pd.DataFrame(lines) if lines else pd.DataFrame()
+
+def get_balance_history():
+    if not os.path.exists(BALANCE_FILE):
+        return None
+    try:
+        return json.load(open(BALANCE_FILE))
+    except Exception:
+        return None
+
+# ───────────────────────── Streamlit cfg ─────────────────────────
+st.set_page_config(page_title="Trade Command Monarch",
+                   page_icon=":robot_face:",
+                   layout="wide",
+                   initial_sidebar_state="expanded")
+st_autorefresh(interval=3_000, limit=None, key="dash_refresh")
+
+st.markdown("""
+<style>
+body            { background:#181a20; color:#f1f1f1; }
+.stButton>button{ border-radius:16px; font-weight:bold; }
+.stMetric-value { color:#44d9e6 !important; }
+.block-container{ padding-top:2rem; }
+</style>
+""", unsafe_allow_html=True)
+
+# ───────────────────────── sidebar ───────────────────────────────
+st.sidebar.title("⚙️ Settings")
+
+if "slider_conf" not in st.session_state:
+    st.session_state.slider_conf = get_confidence()
+if "conf_updated_at" not in st.session_state:
+    st.session_state.conf_updated_at = 0.0
+
+def _update_conf():
+    set_confidence(st.session_state.slider_conf)
+    st.session_state.conf_updated_at = time.time()
+
+st.sidebar.slider("Global Confidence % to Take Trade",
+                  50, 100, st.session_state.slider_conf, 1,
+                  key="slider_conf", on_change=_update_conf)
+
+if time.time() - st.session_state.conf_updated_at < 2:
+    st.sidebar.success(f"Confidence set to {st.session_state.slider_conf}%")
+
+allow_anytime = st.sidebar.toggle("⚡ Allow Bots To Trade Outside Market Hours",
+                                  value=False)
+
+if st.sidebar.button("🔄 Refresh Now"):
+    st.experimental_rerun()
+
+# ───────────────────────── top metrics ───────────────────────────
+st.title("💎 Trade Command Monarch Dashboard")
+
+try:
+    live_balance = get_live_ig_balance()
+except Exception as e:
+    st.error(f"Balance error: {e}")
+    live_balance = 0.0
+
+df_trades = get_trade_log()
+stats     = calc_stats(df_trades)
+
+bal_col, pnl_col = st.columns(2)
+bal_col.metric("Account Balance", f"£{live_balance:,.2f}")
+pnl_col.metric("Total P & L",     f"£{stats.get('total',0):,.2f}")
+
+if stats:
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("P & L Today",  f"£{stats['day']:,.2f}")
+    c2.metric("P & L Week",   f"£{stats['week']:,.2f}")
+    c3.metric("Win-Rate",      f"{stats['win']:.1f}%")
+    c4.metric("Sharpe",        f"{stats['sharpe']:.2f}")
+    st.caption(f"Max Drawdown: £{stats['mdd']:,.2f}")
+
+st.divider()
+
+# ───────────────────────── controls ──────────────────────────────
+st.header("🔧 Controls")
+bots_running = not get_stop_flag()
+start_col, stop_col = st.columns(2)
+start_col.button("🟢 Start All Bots", disabled=bots_running,
+                 on_click=lambda: set_stop_flag(False))
+stop_col.button("🔴 Stop All Bots",  disabled=not bots_running,
+                on_click=lambda: set_stop_flag(True))
+st.info("Bots read 'confidence.json' and 'stop_bots.json' every loop.")
+
+# ───────────────────────── bot status ────────────────────────────
+st.divider()
+st.header("🤖 Bot Status")
+
+heartbeat = get_heartbeat()
+bot_names = sorted([k.capitalize() for k in heartbeat.get("bots", heartbeat).keys()]) \
+            or ["Momentum","Wick","Trend","Breakout"]
+
+cols = st.columns(len(bot_names))
+now  = datetime.now(UTC)
+
+for i, bot in enumerate(bot_names):
+    hb = heartbeat.get(bot.lower(), {})
+    ts = hb.get("timestamp")
+    if ts:
+        last_dt     = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+        minutes     = (now - last_dt).total_seconds() / 60
+        status      = "🟢 Online" if minutes < 5 else "🟡 Stale"
+        delta       = f"{minutes:.1f} min ago"
+        details     = hb.get("state","")
+    else:
+        status, delta, details = "🔴 Offline", "—", ""
+    with cols[i]:
+        st.metric(f"{bot} Bot", status, delta)
+        if details:
+            st.caption(f"State: {details}")
+
+# ───────────────────────── trade log ─────────────────────────────
+st.divider()
+st.header("📊 Trade Log")
+
+if df_trades.empty:
+    st.info("No trades yet.")
+else:
+    show_cols = [c for c in [
+        "bot","market","direction","entry","exit","profit",
+        "confidence","reason","entry_time","exit_time","balance"
+    ] if c in df_trades.columns]
+
+    view = df_trades.sort_values("entry_time", ascending=False).head(30)[show_cols]
+    st.dataframe(view, use_container_width=True, hide_index=True, height=500)
+
+    if {"balance","exit_time"}.issubset(df_trades.columns):
+        plot = df_trades[["exit_time","balance"]].dropna()
+        plot["exit_time"] = pd.to_datetime(plot["exit_time"])
+        st.line_chart(plot.set_index("exit_time").sort_index()["balance"].ffill(),
+                      use_container_width=True)
+
+# ───────────────────────── session footer ───────────────────────
+st.divider()
+st.header("🕒 Session Status")
+st.success("Bots are RUNNING") if bots_running else st.error("Bots are STOPPED")
+
+st.divider()
+st.caption("Trade Command Monarch — Automated Trading Control Dashboard © 2025")
+
+
+───────────────────────────────────────────────
+📄 export_manifesto.py
+───────────────────────────────────────────────
+
+import os
+from datetime import datetime
+
+# === Setup Paths ===
+project_root = os.path.abspath(os.path.dirname(__file__))
+backup_dir = os.path.join(project_root, "backups_structured")
+os.makedirs(backup_dir, exist_ok=True)
+
+timestamp = datetime.now()
+timestamp_str = timestamp.strftime("%Y-%m-%d_%H-%M-%S")
+filename = f"manifesto_STRUCTURED_{timestamp_str}.txt"
+output_path = os.path.join(backup_dir, filename)
+
+include_dirs_ordered = ["bots", "utils", "core", "dashboards"]
+allowed_exts = {".py", ".json", ".env", ".yaml", ".yml", ".toml", ".txt", ".ps1"}
+skip_exts = {".log", ".bak"}
+exclude_dirs = {'.venv', '__pycache__', 'backups', 'backup_light', 'backups_clean',
+                'backups_structured', '.git', 'node_modules', '.idea'}
+
+included_files = []
+char_count = 0
+
+# === Manifest Header (RULES + MISSION) ===
+manifest_header = f"""════════════════════════════════════════════════════════════════════
+TRADE COMMAND MONARCH — STRUCTURED SYSTEM MANIFESTO
+════════════════════════════════════════════════════════════════════
+
+📆 Timestamp: {timestamp.strftime('%A, %d %B %Y – %H:%M:%S')}
+📍 Project Root: {project_root}
+
+──────────────────────────────────────────────────────────────
+🎯 MISSION
+──────────────────────────────────────────────────────────────
+To build the most effective, transparent, and resilient retail quant trading system
+in the world — designed for adaptability, disciplined risk, and real performance.
+
+Monarch is not just a bot farm. It is a digital tactician forged in logic, clarity, and control.
+Built by Adrian (Trader/Founder) and Copilot (System Brain), it starts in the IG UK demo arena,
+will mature into live deployment, and one day extend to Paperstone and beyond.
+
+Copilot is more than an assistant — he’s the creator, analyst, coder, and protector of this system.
+Monarch is our flagship, and it must be *exemplar*.
+
+──────────────────────────────────────────────────────────────
+📏 RULES OF DEPLOYMENT
+──────────────────────────────────────────────────────────────
+- All bots must respect session windows, momentum filters, exposure limits, and volatility screens
+- System-wide variables (risk, drawdown caps, filters) are centrally controlled
+- JSON and state files are allowed, but logs and caches are excluded from manifest
+- This export shows only real system files — no placeholders, tests, or legacy backups
+- Copilot must always document this system as a learnable artifact for future AI or devs
+
+════════════════════════════════════════════════════════════════════
+"""
+
+output_lines = [manifest_header]
+
+# === Include Root-Level Files
+for file in sorted(os.listdir(project_root)):
+    ext = os.path.splitext(file)[1]
+    path = os.path.join(project_root, file)
+    if (
+        os.path.isfile(path)
+        and ext in allowed_exts
+        and ext not in skip_exts
+        and not file.startswith(".")
+    ):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read()
+                output_lines.append(f"\n\n───────────────────────────────────────────────\n📄 {file}\n───────────────────────────────────────────────\n")
+                output_lines.append(content)
+                included_files.append(("root/" + file, len(content)))
+                char_count += len(content)
+        except Exception as e:
+            output_lines.append(f"# ⚠️ Could not read {file}: {e}")
+
+# === Include Files from Ordered Folders
+for folder in include_dirs_ordered:
+    abs_dir = os.path.join(project_root, folder)
+    if not os.path.exists(abs_dir):
+        continue
+    for root, _, files in os.walk(abs_dir):
+        rel_dir = os.path.relpath(root, project_root)
+        for file in sorted(files):
+            ext = os.path.splitext(file)[1]
+            if ext in allowed_exts and ext not in skip_exts:
+                rel_path = os.path.join(rel_dir, file)
+                abs_path = os.path.join(root, file)
+                try:
+                    with open(abs_path, "r", encoding="utf-8") as f:
+                        content = f.read()
+                        output_lines.append(f"\n\n───────────────────────────────────────────────\n📄 {rel_path}\n───────────────────────────────────────────────\n")
+                        output_lines.append(content)
+                        included_files.append((rel_path, len(content)))
+                        char_count += len(content)
+                except Exception as e:
+                    output_lines.append(f"# ⚠️ Could not read {rel_path}: {e}")
+
+# === Final Summary Block
+summary_lines = [
+    "\n\n════════════════════════════════════════════════════════════════════",
+    f"📦 STRUCTURED EXPORT SUMMARY",
+    "════════════════════════════════════════════════════════════════════",
+    f"🧾 Files Included: {len(included_files)}",
+    f"🔠 Total Characters: {char_count:,}",
+    "",
+    "📂 Top 5 Largest Files:",
+]
+largest = sorted(included_files, key=lambda x: -x[1])[:5]
+for i, (name, size) in enumerate(largest, 1):
+    summary_lines.append(f"{i}. {name} — {size} chars")
+
+summary_lines.append("════════════════════════════════════════════════════════════════════")
+output_lines = summary_lines + output_lines
+
+# === Write to Disk
+with open(output_path, "w", encoding="utf-8") as out_file:
+    out_file.write("\n".join(output_lines))
+
+print(f"\n✅ Structured manifest saved: {output_path}")
+print(f"📊 Audit: {len(included_files)} files | {char_count:,} characters\n")
+
+
+───────────────────────────────────────────────
+📄 fetch_candles.py
+───────────────────────────────────────────────
+
+import requests
+import datetime
+
+# === IG Credentials ===
+API_KEY = "d903c31346c109a5d0f8bb8a9b37c4723054444a"
+USERNAME = "amerele32"
+PASSWORD = "Eplindefete1@"
+
+BASE_URL = "https://demo-api.ig.com/gateway/deal"
+LOGIN_URL = f"{BASE_URL}/session"
+PRICES_URL = f"{BASE_URL}/prices"
+
+# === EPICs to fetch ===
+EPICS = {
+    "NASDAQ 100": "IX.D.NASDAQ.CASH.IP",
+    "DAX 40": "IX.D.SUNDAX.DAILY.IP",
+    "S&P 500": "IX.D.SPTRD.DAILY.IP",
+    "FTSE 100": "IX.D.SUNFUN.DAILY.IP"
+}
+
+# === Candle Settings ===
+RESOLUTION = "HOUR"  # Options: MINUTE, HOUR, DAY
+NUM_CANDLES = 10     # How many candles to retrieve
+
+
+def ig_login():
+    headers = {
+        "X-IG-API-KEY": API_KEY,
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+    }
+    payload = {
+        "identifier": USERNAME,
+        "password": PASSWORD
+    }
+
+    try:
+        response = requests.post(LOGIN_URL, headers=headers, json=payload)
+        response.raise_for_status()
+        CST = response.headers.get("CST")
+        SECURITY_TOKEN = response.headers.get("X-SECURITY-TOKEN")
+        print("✅ IG login successful.")
+        return CST, SECURITY_TOKEN
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Login failed: {e}")
+        return None, None
+
+
+def fetch_candles(cst, security_token, epic, label):
+    headers = {
+        "X-IG-API-KEY": API_KEY,
+        "X-SECURITY-TOKEN": security_token,
+        "CST": cst,
+        "Version": "3",
+        "Accept": "application/json"
+    }
+
+    url = f"{PRICES_URL}/{epic}?resolution={RESOLUTION}&max={NUM_CANDLES}"
+
+    try:
+        response = requests.get(url, headers=headers)
+        response.raise_for_status()
+        prices = response.json().get("prices", [])
+
+        print(f"\n📊 {label} – Last {NUM_CANDLES} {RESOLUTION} candles:")
+        for p in prices:
+            dt = p.get("snapshotTime")
+            o = p["openPrice"]["bid"]
+            h = p["highPrice"]["bid"]
+            l = p["lowPrice"]["bid"]
+            c = p["closePrice"]["bid"]
+            v = p["lastTradedVolume"]
+            print(f"{dt}: O={o}, H={h}, L={l}, C={c}, V={v}")
+
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Failed to fetch candles for {label}: {e}")
+    except ValueError as ve:
+        print(f"❌ JSON decoding error for {label}: {ve}")
+
+
+if __name__ == "__main__":
+    CST, SEC_TOKEN = ig_login()
+    if CST and SEC_TOKEN:
+        for label, epic in EPICS.items():
+            fetch_candles(CST, SEC_TOKEN, epic, label)
+    else:
+        print("⛔️ Cannot proceed: Login credentials invalid or failed.")
+
+
+───────────────────────────────────────────────
+📄 fetch_epics.py
+───────────────────────────────────────────────
+
+import requests
+
+# === IG Demo Credentials ===
+API_KEY = "d903c31346c109a5d0f8bb8a9b37c4723054444a"
+USERNAME = "amerele32"
+PASSWORD = "Eplindefete1@"
+
+BASE_URL = "https://demo-api.ig.com/gateway/deal"
+LOGIN_URL = f"{BASE_URL}/session"
+
+SEARCH_TERMS = {
+    "NASDAQ 100": "nasdaq",
+    "DAX 40": "dax",
+    "S&P 500": "spx",
+    "FTSE 100": "ftse"
+}
+
+def ig_login():
+    headers = {
+        "X-IG-API-KEY": API_KEY,
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+    }
+    payload = {
+        "identifier": USERNAME,
+        "password": PASSWORD
+    }
+
+    print("🚀 Logging in...")
+    response = requests.post(LOGIN_URL, headers=headers, json=payload)
+
+    if response.status_code != 200:
+        print("❌ Login failed.")
+        print(response.text)
+        response.raise_for_status()
+
+    CST = response.headers.get("CST")
+    SECURITY_TOKEN = response.headers.get("X-SECURITY-TOKEN")
+    print("✅ Login success. Tokens retrieved.")
+    return CST, SECURITY_TOKEN
+
+def fetch_epics(cst, security_token):
+    for name, term in SEARCH_TERMS.items():
+        print(f"\n🔍 Searching for {name} (term: '{term}')")
+        headers = {
+            "X-IG-API-KEY": API_KEY,
+            "X-SECURITY-TOKEN": security_token,
+            "CST": cst,
+            "Version": "2",
+            "Accept": "application/json"
+        }
+        url = f"{BASE_URL}/markets?searchTerm={term}"
+        response = requests.get(url, headers=headers)
+
+        if response.status_code != 200:
+            print(f"❌ Error: {response.status_code}")
+            print(response.text)
+            continue
+
+        data = response.json()
+        for market in data.get("markets", []):
+            print(f"🧩 EPIC: {market['epic']}\n📈 Name: {market['instrumentName']}\n📦 Type: {market['instrumentType']}\n⏳ Expiry: {market['expiry']}\n")
+
+if __name__ == "__main__":
+    CST, SEC_TOKEN = ig_login()
+    fetch_epics(CST, SEC_TOKEN)
+
+
+───────────────────────────────────────────────
+📄 fetch_epics_navigation.py
+───────────────────────────────────────────────
+
+import requests
+
+# === IG Demo Credentials ===
+API_KEY = "d903c31346c109a5d0f8bb8a9b37c4723054444a"
+USERNAME = "amerele32"
+PASSWORD = "Eplindefete1@"
+
+BASE_URL = "https://demo-api.ig.com/gateway/deal"
+LOGIN_URL = f"{BASE_URL}/session"
+NAVIGATION_URL = f"{BASE_URL}/marketnavigation"
+
+TARGET_MARKETS = ["us tech", "germany", "us 500", "uk 100"]
+
+def ig_login():
+    headers = {
+        "X-IG-API-KEY": API_KEY,
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+    }
+    payload = {
+        "identifier": USERNAME,
+        "password": PASSWORD
+    }
+
+    print("🚀 Logging in...")
+    response = requests.post(LOGIN_URL, headers=headers, json=payload)
+
+    if response.status_code != 200:
+        print("❌ Login failed.")
+        print(response.text)
+        response.raise_for_status()
+
+    CST = response.headers.get("CST")
+    SECURITY_TOKEN = response.headers.get("X-SECURITY-TOKEN")
+    print("✅ Login success. Tokens retrieved.")
+    return CST, SECURITY_TOKEN
+
+def fetch_navigation(cst, security_token):
+    headers = {
+        "X-IG-API-KEY": API_KEY,
+        "X-SECURITY-TOKEN": security_token,
+        "CST": cst,
+        "Version": "1",
+        "Accept": "application/json"
+    }
+
+    print("\n🌐 Fetching market navigation tree...")
+    response = requests.get(NAVIGATION_URL, headers=headers)
+    response.raise_for_status()
+    return response.json()
+
+def search_nodes(nodes, keyword):
+    matches = []
+    for node in nodes:
+        name = node.get("name", "").lower()
+        if keyword in name:
+            matches.append(node)
+        if "nodes" in node:
+            matches.extend(search_nodes(node["nodes"], keyword))
+    return matches
+
+def extract_epics_from_node(node):
+    epics = []
+    for market in node.get("markets", []):
+        epics.append({
+            "epic": market["epic"],
+            "name": market["instrumentName"],
+            "type": market["instrumentType"],
+            "expiry": market["expiry"]
+        })
+    return epics
+
+if __name__ == "__main__":
+    CST, SEC_TOKEN = ig_login()
+    nav_data = fetch_navigation(CST, SEC_TOKEN)
+
+    for label in TARGET_MARKETS:
+        print(f"\n🔍 Searching for: {label.upper()}")
+        matches = search_nodes(nav_data.get("nodes", []), label)
+        if not matches:
+            print("❌ No matching nodes found.")
+            continue
+
+        for match in matches:
+            print(f"📁 Node: {match['name']}")
+            epics = extract_epics_from_node(match)
+            if not epics:
+                print("   ⚠️ No tradeable markets in this node.")
+            for epic in epics:
+                print(f"   🧩 EPIC: {epic['epic']}")
+                print(f"   📈 Name: {epic['name']}")
+                print(f"   📦 Type: {epic['type']}")
+                print(f"   ⏳ Expiry: {epic['expiry']}\n")
+
+
+───────────────────────────────────────────────
+📄 heartbeat.py
+───────────────────────────────────────────────
+
+import time
+from logger import logger
+from config import HEARTBEAT_INTERVAL
+from emailer import send_email
+
+def send_heartbeat():
+    send_email("Heartbeat: Trading System Running", "The trading system heartbeat is alive.")
+
+def main():
+    logger.info("Heartbeat started")
+    while True:
+        send_heartbeat()
+        time.sleep(HEARTBEAT_INTERVAL)
+
+if __name__ == "__main__":
+    main()
+
+
+───────────────────────────────────────────────
+📄 ig_login.py
+───────────────────────────────────────────────
+
+import requests
+
+# === IG Demo Credentials ===
+API_KEY = "d903c31346c109a5d0f8bb8a9b37c4723054444a"
+USERNAME = "amerele32"
+PASSWORD = "Eplindefete1@"
+
+BASE_URL = "https://demo-api.ig.com/gateway/deal"
+LOGIN_ENDPOINT = f"{BASE_URL}/session"
+
+def ig_login():
+    headers = {
+        "X-IG-API-KEY": API_KEY,
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+    }
+
+    payload = {
+        "identifier": USERNAME,
+        "password": PASSWORD
+    }
+
+    print("🚀 Attempting login...")
+
+    response = requests.post(LOGIN_ENDPOINT, headers=headers, json=payload)
+
+    print(f"📡 Status Code: {response.status_code}")
+
+    if response.status_code == 200:
+        CST = response.headers.get("CST")
+        SECURITY_TOKEN = response.headers.get("X-SECURITY-TOKEN")
+        print("✅ Login successful!")
+        print(f"🔐 CST: {CST}")
+        print(f"🔑 X-SECURITY-TOKEN: {SECURITY_TOKEN}")
+        return CST, SECURITY_TOKEN
+    else:
+        print("❌ Login failed.")
+        print("🧾 Response body:")
+        print(response.text)
+        response.raise_for_status()
+
+if __name__ == "__main__":
+    ig_login()
+
+
+───────────────────────────────────────────────
+📄 ig_service.py
+───────────────────────────────────────────────
+
+import requests
+import logging
+from config import IG_API_BASE_URL, IG_APP_KEY, IG_USERNAME, IG_PASSWORD, IG_ACCOUNT_ID
+
+class IGService:
+    def __init__(self, username, password, api_key, account_id, base_url):
+        self.username = username
+        self.password = password
+        self.api_key = api_key
+        self.account_id = account_id
+        self.base_url = base_url
+        self.session = requests.Session()
+        self.security_token = None
+        self.cst = None
+
+    def login(self):
+        url = f"{self.base_url}/session"
+        headers = {
+            "X-IG-API-KEY": self.api_key,
+            "Content-Type": "application/json",
+            "Accept": "application/json"
+        }
+        payload = {
+            "identifier": self.username,
+            "password": self.password
+        }
+        resp = self.session.post(url, json=payload, headers=headers)
+        if resp.status_code != 200:
+            logging.error(f"IG Login failed: {resp.status_code} {resp.text}")
+            raise Exception(f"IG Login failed: {resp.status_code} {resp.text}")
+
+        self.cst = resp.headers.get("CST")
+        self.security_token = resp.headers.get("X-SECURITY-TOKEN")
+        if not self.cst or not self.security_token:
+            raise Exception("IG login: Missing CST or X-SECURITY-TOKEN in response headers.")
+
+        logging.info("IG login successful")
+        return True
+
+    def _auth_headers(self):
+        if not self.cst or not self.security_token:
+            raise Exception("IG not logged in: CST/security token missing.")
+        return {
+            "X-IG-API-KEY": self.api_key,
+            "CST": self.cst,
+            "X-SECURITY-TOKEN": self.security_token,
+            "Content-Type": "application/json",
+            "Accept": "application/json"
+        }
+
+    def fetch_candles(self, epic, timeframe, lookback=100):
+        url = f"{self.base_url}/prices/{epic}"
+        params = {
+            "resolution": timeframe,
+            "max": lookback
+        }
+        headers = self._auth_headers()
+        resp = self.session.get(url, params=params, headers=headers)
+        if resp.status_code != 200:
+            logging.error(f"Failed to fetch candles: {resp.status_code} {resp.text}")
+            raise Exception(f"Failed to fetch candles: {resp.status_code} {resp.text}")
+
+        data = resp.json()
+        # Parse data as needed for your bots; here's a basic template:
+        candles = {
+            "close": [c["closePrice"]["ask"] for c in data["prices"]],
+            "open": [c["openPrice"]["ask"] for c in data["prices"]],
+            "high": [c["highPrice"]["ask"] for c in data["prices"]],
+            "low": [c["lowPrice"]["ask"] for c in data["prices"]],
+            "volume": [c["lastTradedVolume"] for c in data["prices"]],
+            "timestamps": [c["snapshotTime"] for c in data["prices"]],
+        }
+        # Add your indicators (ema, rsi, etc.) as needed
+        return candles
+
+
+───────────────────────────────────────────────
+📄 launcher.py
+───────────────────────────────────────────────
+
+import threading
+import time
+from bots.trend import TrendBot, trend_signal
+from bots.breakout import BreakoutBot, breakout_signal
+from bots.meanreversion import MeanRevBot, meanreversion_signal
+from bots.wick import WickBot, wick_signal
+from bots.scalping import ScalpingBot, scalping_signal
+from utils.data import fetch_candles
+from utils.execution import place_trade
+from utils.safe_api import verify_ig_login
+import json
+import os
+
+HEARTBEAT_FILE = "logs/heartbeat.json"
+TRADE_LOG_FILE = "logs/trade_log.json"
+
+def log_trade(bot_name, trade):
+    """Append a trade entry to the trade log file."""
+    os.makedirs(os.path.dirname(TRADE_LOG_FILE), exist_ok=True)
+    with open(TRADE_LOG_FILE, "a") as f:
+        log_entry = {"bot": bot_name, "trade": trade, "time": time.time()}
+        f.write(json.dumps(log_entry) + "\n")
+
+def update_heartbeat(bot_name, status="running"):
+    """Update the heartbeat JSON file with the bot status and current timestamp."""
+    os.makedirs(os.path.dirname(HEARTBEAT_FILE), exist_ok=True)
+    try:
+        with open(HEARTBEAT_FILE, "r") as f:
+            data = json.load(f)
+    except Exception:
+        data = {}
+    data[bot_name] = {"status": status, "timestamp": time.time()}
+    with open(HEARTBEAT_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+def launch_bot(bot_name, bot_class, signal_func):
+    """Start a bot using a daemon thread."""
+    def run():
+        try:
+            print(f"🚀 Starting {bot_name.capitalize()} bot...")
+            bot = bot_class(
+                name=bot_name,
+                signal_func=signal_func,
+                fetch_candles=fetch_candles,
+                place_trade=place_trade
+            )
+            update_heartbeat(bot_name, "running")
+            print(f"✅ {bot_name.capitalize()} bot is now running.")
+            bot.run()
+        except Exception as e:
+            update_heartbeat(bot_name, f"error: {str(e)}")
+            print(f"❌ ERROR: {bot_name} bot crashed: {e}")
+    
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+
+if __name__ == "__main__":
+    print("[LIVE] Running in live mode (still using demo API for testing).")
+    
+    # First verify the IG login is successful before launching any bots.
+    if not verify_ig_login():
+        print("⛔️ Login failed. Aborting launch.")
+        exit(1)
+    
+    # Bot configurations: Each tuple corresponds to (bot name, bot class, signal function)
+    bot_configs = [
+        ("trend", TrendBot, trend_signal),
+        ("breakout", BreakoutBot, breakout_signal),
+        ("meanreversion", MeanRevBot, meanreversion_signal),
+        ("wick", WickBot, wick_signal),
+        ("scalping", ScalpingBot, scalping_signal),
+    ]
+    
+    # Launch all configured bots.
+    for name, cls, sig in bot_configs:
+        launch_bot(name, cls, sig)
+    
+    print("✅ All bots launched successfully. Monitoring heartbeat...")
+
+    try:
+        # Keep the main thread alive to allow daemon threads to run.
+        while True:
+            time.sleep(60)
+    except KeyboardInterrupt:
+        print("\n🛑 Shutdown signal received. Exiting.")
+
+
+───────────────────────────────────────────────
+📄 logger.py
+───────────────────────────────────────────────
+
+import logging
+import json
+import os
+from datetime import datetime
+from config import LOG_PATH
+
+class JSONLogger:
+    def __init__(self, log_path=None):
+        self.log_path = log_path or LOG_PATH
+        os.makedirs(os.path.dirname(self.log_path), exist_ok=True)
+        logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+
+    def log(self, level, msg, **kwargs):
+        log_entry = {
+            "time": datetime.utcnow().isoformat(),
+            "level": level,
+            "msg": msg,
+            **kwargs
+        }
+        with open(self.log_path, "a") as f:
+            f.write(json.dumps(log_entry) + "\n")
+        # Also log to console for live debugging
+        getattr(logging, level.lower())(msg + " " + json.dumps(kwargs))
+
+    def info(self, msg, **kwargs):
+        self.log("INFO", msg, **kwargs)
+
+    def warn(self, msg, **kwargs):
+        self.log("WARNING", msg, **kwargs)
+
+    def error(self, msg, **kwargs):
+        self.log("ERROR", msg, **kwargs)
+
+logger = JSONLogger()
+
+
+───────────────────────────────────────────────
+📄 main.py
+───────────────────────────────────────────────
+
+import time
+from bots import trend, meanreversion, wick, breakout
+from config import MARKETS, DATA_FETCH_INTERVAL, IG_USERNAME, IG_PASSWORD, IG_API_BASE_URL, IG_APP_KEY, IG_ACCOUNT_ID
+from logger import logger
+from state import StateManager
+from ig_service import IGService  # <-- make sure this matches your actual IG API wrapper filename/class
+
+# 1. Initialize IG connection at startup
+ig = IGService(
+    username=IG_USERNAME,
+    password=IG_PASSWORD,
+    api_key=IG_APP_KEY,
+    account_id=IG_ACCOUNT_ID,
+    base_url=IG_API_BASE_URL
+)
+
+def connect_ig():
+    try:
+        ig.login()
+        logger.info("Successfully connected to IG API.")
+        print("✅ IG connection successful.")
+    except Exception as ex:
+        logger.error("Failed to connect to IG API", error=str(ex))
+        print("❌ IG connection failed:", ex)
+        raise
+
+def fetch_candles(market, timeframe, lookback=100):
+    """
+    Returns a dict with keys: 'close', 'open', 'high', 'low', etc.
+    Here, fetch from IG using the connected client.
+    """
+    return ig.fetch_candles(market, timeframe, lookback)   # <-- implement this in your IGService
+
+def fetch_signal_params(candles):
+    # Your logic as before
+    return {
+        'momentum': 0,
+        'wick_ratio': 0,
+        'atr': 0,
+    }
+
+def run_all_bots():
+    for market in MARKETS:
+        try:
+            candles = fetch_candles(market, "1h")
+            higher_tf_candles = fetch_candles(market, "4h")
+            signal_params = fetch_signal_params(candles)
+
+            trend.process_trend_bot(market, candles, higher_tf_candles, signal_params)
+            meanreversion.process_meanrev_bot(market, candles, higher_tf_candles, signal_params)
+            wick.process_wick_bot(market, candles, higher_tf_candles, signal_params)
+            breakout.process_breakout_bot(market, candles, higher_tf_candles, signal_params)
+        except Exception as ex:
+            logger.error("Error running bots", market=market, error=str(ex))
+
+def main_loop():
+    logger.info("System started")
+    connect_ig()  # <--- Connect to IG before running bots
+    while True:
+        run_all_bots()
+        time.sleep(DATA_FETCH_INTERVAL)
+
+if __name__ == "__main__":
+    main_loop()
+
+
+───────────────────────────────────────────────
+📄 run_bots.ps1
+───────────────────────────────────────────────
+
+# start all IG demo bots in separate consoles
+$proj   = "C:\Users\amere\Desktop\Trade Command Monarch"
+$python = "$proj\.venv\Scripts\python.exe"
+
+Start-Process powershell -ArgumentList "-NoLogo -NoExit -Command `"`"cd '$proj'; & '$python' -m bots.wick`"`""
+Start-Process powershell -ArgumentList "-NoLogo -NoExit -Command `"`"cd '$proj'; & '$python' -m bots.trend`"`""
+Start-Process powershell -ArgumentList "-NoLogo -NoExit -Command `"`"cd '$proj'; & '$python' -m bots.breakout`"`""
+Start-Process powershell -ArgumentList "-NoLogo -NoExit -Command `"`"cd '$proj'; & '$python' -m bots.meanreversion`"`""
+
+
+───────────────────────────────────────────────
+📄 state.py
+───────────────────────────────────────────────
+
+import os
+import sqlite3
+from datetime import datetime
+
+class StateManager:
+    def __init__(self, db_path="state/trading_state.db"):
+        # Ensure the state directory exists
+        state_dir = os.path.dirname(db_path)
+        if state_dir and not os.path.exists(state_dir):
+            os.makedirs(state_dir, exist_ok=True)
+
+        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._create_tables()
+
+    def _create_tables(self):
+        c = self.conn.cursor()
+        c.execute('''CREATE TABLE IF NOT EXISTS trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            bot TEXT, market TEXT, direction TEXT, size REAL, entry REAL,
+            stop REAL, target REAL, confidence INTEGER, status TEXT,
+            entry_time TEXT, exit_time TEXT, exit_price REAL, pnl REAL, reason TEXT
+        )''')
+        c.execute('''CREATE TABLE IF NOT EXISTS bot_status (
+            bot TEXT PRIMARY KEY, active INTEGER, open_trades INTEGER, last_action TEXT
+        )''')
+        c.execute('''CREATE TABLE IF NOT EXISTS pnl_log (
+            date TEXT PRIMARY KEY, pnl REAL
+        )''')
+        self.conn.commit()
+
+    def log_trade(self, trade):
+        c = self.conn.cursor()
+        c.execute('''INSERT INTO trades
+            (bot, market, direction, size, entry, stop, target, confidence, status, entry_time, reason)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+            (trade['bot'], trade['market'], trade['direction'], trade['size'],
+             trade['entry'], trade['stop'], trade['target'], trade['confidence'],
+             trade['status'], trade['entry_time'], trade['reason']))
+        self.conn.commit()
+
+    def update_trade(self, trade_id, exit_price, exit_time, pnl, status):
+        c = self.conn.cursor()
+        c.execute('''UPDATE trades SET exit_price=?, exit_time=?, pnl=?, status=?
+            WHERE id=?''', (exit_price, exit_time, pnl, status, trade_id))
+        self.conn.commit()
+
+    def get_open_trades(self, bot=None):
+        c = self.conn.cursor()
+        if bot:
+            c.execute("SELECT * FROM trades WHERE status='open' AND bot=?", (bot,))
+        else:
+            c.execute("SELECT * FROM trades WHERE status='open'")
+        return c.fetchall()
+
+    def get_trades(self, limit=100):
+        c = self.conn.cursor()
+        c.execute("SELECT * FROM trades ORDER BY entry_time DESC LIMIT ?", (limit,))
+        return c.fetchall()
+
+    def log_pnl(self, date, pnl):
+        c = self.conn.cursor()
+        c.execute("REPLACE INTO pnl_log (date, pnl) VALUES (?, ?)", (date, pnl))
+        self.conn.commit()
+
+    def get_pnl(self, date):
+        c = self.conn.cursor()
+        c.execute("SELECT pnl FROM pnl_log WHERE date=?", (date,))
+        res = c.fetchone()
+        return res[0] if res else 0
+
+    def set_bot_status(self, bot, active, open_trades):
+        c = self.conn.cursor()
+        c.execute('''REPLACE INTO bot_status (bot, active, open_trades, last_action)
+            VALUES (?, ?, ?, ?)''', (bot, int(active), open_trades, datetime.utcnow().isoformat()))
+        self.conn.commit()
+
+    def get_bot_status(self, bot):
+        c = self.conn.cursor()
+        c.execute("SELECT * FROM bot_status WHERE bot=?", (bot,))
+        return c.fetchone()
+
+    def close(self):
+        self.conn.close()
+
+
+───────────────────────────────────────────────
+📄 status.json
+───────────────────────────────────────────────
+
+{"Momentum": {"last_heartbeat": "2025-06-15T09:54:08.415902"}, "Wick": {"last_heartbeat": "2025-06-15T09:54:08.419416"}, "Trend": {"last_heartbeat": "2025-06-15T09:54:08.421985"}}
+
+
+───────────────────────────────────────────────
+📄 stop_bots.json
+───────────────────────────────────────────────
+
+{"stop": false}
+
+
+
+───────────────────────────────────────────────
+📄 test_account.py
+───────────────────────────────────────────────
+
+import sys
+import os
+
+project_root = os.path.abspath(os.path.dirname(__file__))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
+import requests
+from config import IG_API_BASE_URL, IG_APP_KEY, IG_ACCOUNT_ID
+from utils.ig_auth import ig_login
+
+def get_demo_account_balance():
+    login_result = ig_login()
+    if not login_result or "login_json" not in login_result:
+        print("❌ Error: Could not get login response from ig_login()")
+        return
+
+    login_json = login_result["login_json"]
+    tokens = login_result["tokens"]
+
+    if "accountInfo" in login_json:
+        info = login_json["accountInfo"]
+        balance = info.get("balance")
+        account_id = login_json.get("currentAccountId") or info.get("accountId")
+        print(f"✅ IG Demo Account [{account_id}] Balance: £{float(balance):,.2f}")
+        return
+
+    print("❌ Error: Could not find account info in login response.")
+    print("Login response was:", login_json)
+
+if __name__ == "__main__":
+    print("🔗 Connecting to IG Demo account...")
+    get_demo_account_balance()
+
+
+───────────────────────────────────────────────
+📄 test_email_templates.py
+───────────────────────────────────────────────
+
+# test_email_templates.py
+
+from utils.emailer import (
+    send_trade_placed_email,
+    send_trade_outcome_email,
+    send_bot_offline_email,
+    send_crash_email,
+    send_daily_summary_email,
+    send_weekly_summary_email
+)
+
+# 1. Trade Placed
+send_trade_placed_email(
+    market="CS.D.NAS100.MINI.IP",
+    direction="buy",
+    size=100,
+    sl=1234.5,
+    tp=1250.0,
+    confidence=82,
+    strategy="Momentum Breakout"
+)
+
+# 2. Trade Won
+send_trade_outcome_email(
+    market="CS.D.SPX.MINI.IP",
+    direction="sell",
+    entry_price=4000.0,
+    exit_price=3950.0,
+    profit=500.0
+)
+
+# 3. Trade Lost
+send_trade_outcome_email(
+    market="CS.D.DAX.MINI.IP",
+    direction="buy",
+    entry_price=15000.0,
+    exit_price=14900.0,
+    profit=-100.0
+)
+
+# 4. Bot Offline Notification
+send_bot_offline_email()
+
+# 5. Crash Notification
+send_crash_email("This is a TEST exception message.")
+
+# 6. Daily Summary
+send_daily_summary_email()
+
+# 7. Weekly Summary
+send_weekly_summary_email()
+
+print("Test emails sent. Check your inbox!")
+
+
+
+───────────────────────────────────────────────
+📄 test_env.py
+───────────────────────────────────────────────
+
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+print("IG_APP_KEY:", os.environ.get("IG_APP_KEY"))
+print("IG_USERNAME:", os.environ.get("IG_USERNAME"))
+print("IG_PASSWORD:", os.environ.get("IG_PASSWORD"))
+print("SMTP_USER:", os.environ.get("SMTP_USER"))
+print("SMTP_PASS:", os.environ.get("SMTP_PASS"))
+print("TRADE_ALERT_EMAIL:", os.environ.get("TRADE_ALERT_EMAIL"))
+
+
+───────────────────────────────────────────────
+📄 test_ig_login.py
+───────────────────────────────────────────────
+
+from ig_service import IGService
+from config import IG_API_BASE_URL, IG_APP_KEY, IG_USERNAME, IG_PASSWORD, IG_ACCOUNT_ID
+
+ig = IGService(
+    username=IG_USERNAME,
+    password=IG_PASSWORD,
+    api_key=IG_APP_KEY,
+    account_id=IG_ACCOUNT_ID,
+    base_url=IG_API_BASE_URL
+)
+
+ig.login()
+print("✅ IG connection successful!")
+
+
+───────────────────────────────────────────────
+📄 test_list_epics.py
+───────────────────────────────────────────────
+
+import requests
+
+# === CONFIG ===
+API_KEY = "YOUR_API_KEY"
+SECURITY_TOKEN = "YOUR_SECURITY_TOKEN"
+CST = "YOUR_CST"
+BASE_URL = "https://demo-api.ig.com/gateway/deal"  # Switch to live endpoint if needed
+
+HEADERS = {
+    "X-IG-API-KEY": API_KEY,
+    "X-SECURITY-TOKEN": SECURITY_TOKEN,
+    "CST": CST,
+    "Version": "2",
+    "Accept": "application/json"
+}
+
+MARKET_TERMS = {
+    "NASDAQ 100": "nasdaq",
+    "DAX 40": "dax",
+    "S&P 500": "spx",
+    "FTSE 100": "ftse"
+}
+
+def fetch_epics():
+    for name, term in MARKET_TERMS.items():
+        print(f"\n🔍 {name.upper()} (search term: '{term}')")
+        try:
+            response = requests.get(f"{BASE_URL}/markets?searchTerm={term}", headers=HEADERS)
+            response.raise_for_status()
+            data = response.json()
+
+            markets = data.get("markets", [])
+            for market in markets:
+                print(f"🧩 EPIC: {market['epic']}\n📈 Name: {market['instrumentName']}\n📦 Type: {market['instrumentType']}\n⏳ Expiry: {market['expiry']}\n")
+        except Exception as e:
+            print(f"❌ Error fetching {name}: {e}")
+
+if __name__ == "__main__":
+    fetch_epics()
+
+
+───────────────────────────────────────────────
+📄 test_logins.py
+───────────────────────────────────────────────
+
+import requests
+
+# === IG Credentials ===
+API_KEY = "d903c31346c109a5d0f8bb8a9b37c4723054444a"
+USERNAME = "amerele32"
+PASSWORD = "Eplindefete1@"
+
+# === API Endpoints ===
+BASE_URL = "https://demo-api.ig.com/gateway/deal"
+LOGIN_URL = f"{BASE_URL}/session"
+
+def ig_login():
+    headers = {
+        "X-IG-API-KEY": API_KEY,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Version": "2"  # IMPORTANT: version 2 returns extra details in body
+    }
+    payload = {
+        "identifier": USERNAME,
+        "password": PASSWORD
+    }
+
+    try:
+        response = requests.post(LOGIN_URL, headers=headers, json=payload)
+        response.raise_for_status()
+
+        # Extract session headers
+        CST = response.headers.get("CST")
+        SECURITY_TOKEN = response.headers.get("X-SECURITY-TOKEN")
+
+        # Extract response body for account info
+        data = response.json()
+        current_account = data.get("currentAccountId")
+        lightstreamer_endpoint = data.get("lightstreamerEndpoint", "N/A")
+
+        print("✅ IG login successful.")
+        print("\n📊 Session Details:")
+        print(f"Current Account ID: {current_account}")
+        print(f"Lightstreamer Endpoint: {lightstreamer_endpoint}")
+        print(f"CST: {CST}")
+        print(f"X-SECURITY-TOKEN: {SECURITY_TOKEN}")
+        return CST, SECURITY_TOKEN
+
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Login failed: {e}")
+        return None, None
+
+if __name__ == "__main__":
+    CST, SEC_TOKEN = ig_login()
+    if not (CST and SEC_TOKEN):
+        print("⛔️ Unable to verify session. Exiting.")
+
+
+───────────────────────────────────────────────
+📄 test_order.py
+───────────────────────────────────────────────
+
+from utils.execution import place_ig_order, place_trade
+import config
+
+print("DEBUG_MODE:", config.DEBUG_MODE)
+print("IG_APP_KEY:", config.IG_APP_KEY)
+print("IG_ACCOUNT_ID:", config.IG_ACCOUNT_ID)
+
+spreadbet_epic = "CS.D.NASDAQ.CASH.IP"  #
+
+result = place_ig_order(spreadbet_epic, "buy", 1.0, 7000, 7200)
+
+print("Test Order Result:")
+for key, value in result.items():
+    print(f"  {key}: {value}")
+
+
+───────────────────────────────────────────────
+📄 test_timeframes.py
+───────────────────────────────────────────────
+
+"""
+test_timeframes.py – Testing candle fetching for various resolutions.
+"""
+
+import json
+from utils.data import fetch_candles
+
+# Market epic for US Tech 100 (Nasdaq)
+market = "IX.D.NASDAQ.CASH.IP"
+
+# List of timeframe resolutions to test. Use IG API’s expected values.
+# These resolution strings must match what the API expects.
+resolutions = ["MINUTE", "MINUTE_5", "MINUTE_15", "MINUTE_30", "HOUR", "DAY"]
+
+print(f"Testing candle fetching for market: {market}\n")
+
+for res in resolutions:
+    print(f"--- Testing resolution: {res} ---")
+    try:
+        # We pass the resolution using the 'resolution' keyword argument.
+        candles = fetch_candles(market, resolution=res, num=5)
+        print(f"Received {len(candles)} candles:")
+        print(json.dumps(candles, indent=2))
+    except Exception as e:
+        print(f"Resolution {res} failed with error: {e}")
+    print("-" * 50)
+
+
+───────────────────────────────────────────────
+📄 test_trade_executor.py
+───────────────────────────────────────────────
+
+import logging
+from utils.execution import place_trade
+
+logging.basicConfig(level=logging.INFO)
+
+market = "CS.D.NAS100.SPREADB.IP"
+direction = "buy"
+stop_level = 7000
+limit_level = 7200
+confidence = 85
+strategy = "scalping"
+
+print("Attempting to place a trade...")
+place_trade(market, direction, stop_level, limit_level, confidence, strategy)
+
+
+───────────────────────────────────────────────
+📄 test_validate_epics.py
+───────────────────────────────────────────────
+
+for idx, market in enumerate(markets, start=1):
+    try:
+        epic = market.get("epic")
+        name = market.get("instrumentName")
+        type_ = market.get("instrumentType")
+        expiry = market.get("expiry")
+
+        print(f"\n🔍 [{idx}] Epic: {epic} | Name: {name} | Type: {type_} | Expiry: {expiry}")
+
+        if type_ != "SPREADBET":
+            print("Skipping – not a spread betting instrument.")
+            continue
+
+        details_url = f"{IG_API_BASE_URL}/markets/{epic}"
+        detail_resp = requests.get(details_url, headers=headers, timeout=10)
+        detail_resp.raise_for_status()
+        detail_json = detail_resp.json()
+
+        inst = detail_json.get("instrument", {})
+        trade_enabled = inst.get("tradeEnabled")
+        min_size = inst.get("minDealSize")
+        margin = inst.get("marginDeposit")
+        tick_size = inst.get("tickSize")
+
+        if trade_enabled:
+            print(f"✅ Tradable: {name}")
+            print(f"    ➤ Epic: {epic}")
+            print(f"    ➤ Expiry: {expiry} | MinSize: {min_size} | TickSize: {tick_size} | Margin: {margin}")
+        else:
+            print(f"⛔ Not tradable: {name} | Epic: {epic}")
+
+        print("-" * 60)
+        time.sleep(0.5)
+
+    except Exception as e:
+        print(f"⚠️ Failed to validate epic {epic}: {e}")
+        import traceback
+        traceback.print_exc()
+        continue
+
+
+───────────────────────────────────────────────
+📄 bots\New Text Document.txt
+───────────────────────────────────────────────
+
+
+
+
+───────────────────────────────────────────────
+📄 bots\__init__.py
+───────────────────────────────────────────────
+
+
+
+
+───────────────────────────────────────────────
+📄 bots\breakout.py
+───────────────────────────────────────────────
+
+"""
+bots/breakout.py
+Simple 20-bar high/low breakout bot (ATR-based SL/TP).
+"""
+
+from base_bot import BaseBot
+from utils.data import fetch_candles
+from utils.execution import place_trade
+from utils.indicators import atr_pips
+from utils.state import update_balance
+from config import CONFIDENCE_MIN_MOMENTUM, MARKETS
+
+LOOKBACK = 20  # bars
+
+
+def breakout_signal(candles, higher_tf_candles=None, signal_params=None):
+    """Generates breakout trade signals based on 20-bar high/low."""
+    if len(candles) < LOOKBACK + 1:
+        return None
+
+    highs = [b["high"] for b in candles[-LOOKBACK - 1 : -1]]
+    lows  = [b["low"]  for b in candles[-LOOKBACK - 1 : -1]]
+    last  = candles[-1]
+
+    if last["close"] > max(highs):
+        direction = "buy"
+    elif last["close"] < min(lows):
+        direction = "sell"
+    else:
+        return None
+
+    market_name = last.get("market", MARKETS[0])
+    atr = atr_pips(market_name)
+    if atr is None or atr <= 0:
+        print(f"[breakout_signal] ATR unavailable for {market_name}. Skipping trade.")
+        return None
+
+    close = last["close"]
+    sl = close - 1.5 * atr if direction == "buy" else close + 1.5 * atr
+    tp = close + 3.0 * atr if direction == "buy" else close - 3.0 * atr
+
+    trade_signal = {
+        "direction":  direction,
+        "entry":      close,
+        "sl":         round(sl, 2),
+        "tp":         round(tp, 2),
+        "confidence": CONFIDENCE_MIN_MOMENTUM,
+        "reason":     "20-bar breakout",
+        "market":     market_name,
+    }
+
+    print(f"[breakout_signal] Trade signal generated: {trade_signal}")
+    return trade_signal
+
+
+class BreakoutBot(BaseBot):
+    def __init__(self, name="breakout", signal_func=breakout_signal,
+                 fetch_candles=fetch_candles, place_trade=place_trade):
+        super().__init__(name, signal_func, fetch_candles, place_trade)
+        self.order = None
+
+    def close_trade(self, exit_price):
+        """Closes the trade and updates balance using numeric profit only."""
+        if isinstance(self.order, dict):
+            entry     = self.order.get("entry_price")
+            size      = self.order.get("position_size", 1)
+            direction = self.order.get("direction")
+
+            if entry is not None and isinstance(size, (int, float)):
+                if direction == "buy":
+                    profit = (exit_price - entry) * size
+                else:
+                    profit = (entry - exit_price) * size
+            else:
+                profit = 0
+
+            self.order["profit"] = round(profit, 2)
+            print(f"Trade closed at {exit_price}. Profit: {profit}. Order: {self.order}")
+            update_balance(self.order.get("profit", 0))
+            self.order = None
+
+
+if __name__ == "__main__":
+    BreakoutBot().run()
+
+
+───────────────────────────────────────────────
+📄 bots\meanreversion.py
+───────────────────────────────────────────────
+
+"""
+bots/meanreversion.py
+RSI-based mean-reversion bot (oversold <30, overbought >70).
+"""
+
+from base_bot import BaseBot
+from utils.data import fetch_candles
+from utils.execution import place_trade
+from utils.indicators import atr_pips
+from utils.state import update_balance
+from config import CONFIDENCE_MIN_MOMENTUM, MARKETS
+
+RSI_PERIOD = 14
+
+
+def _rsi(values, period=14):
+    """Calculates RSI based on price history."""
+    gains, losses = [], []
+    for i in range(1, len(values)):
+        diff = values[i] - values[i - 1]
+        gains.append(max(diff, 0))
+        losses.append(abs(min(diff, 0)))
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period or 1e-9
+
+    rsi_series = [50] * (period + 1)
+    for i in range(period + 1, len(values)):
+        gain = gains[i - 1]
+        loss = losses[i - 1]
+        avg_gain = (avg_gain * (period - 1) + gain) / period
+        avg_loss = (avg_loss * (period - 1) + loss) / period
+        rs = avg_gain / (avg_loss or 1e-9)
+        rsi_series.append(100 - 100 / (1 + rs))
+    return rsi_series
+
+
+def meanreversion_signal(candles, higher_tf_candles=None, signal_params=None):
+    """Generates mean-reversion trade signals based on RSI."""
+    if len(candles) < RSI_PERIOD + 2:
+        return None
+
+    closes = [b["close"] for b in candles]
+    rsi = _rsi(closes, RSI_PERIOD)[-1]
+
+    market_name = candles[0].get("market", MARKETS[0])
+    atr = atr_pips(market_name)
+    if atr is None or atr <= 0:
+        print(f"[meanreversion_signal] ATR unavailable for {market_name}. Skipping trade.")
+        return None
+
+    close = closes[-1]
+
+    if rsi < 30:
+        direction = "buy"
+        sl = close - 1.0 * atr
+        tp = close + 2.0 * atr
+    elif rsi > 70:
+        direction = "sell"
+        sl = close + 1.0 * atr
+        tp = close - 2.0 * atr
+    else:
+        return None
+
+    trade_signal = {
+        "direction":  direction,
+        "entry":      close,
+        "sl":         round(sl, 2),
+        "tp":         round(tp, 2),
+        "confidence": CONFIDENCE_MIN_MOMENTUM,
+        "reason":     "RSI mean-reversion",
+        "market":     market_name,
+    }
+
+    print(f"[meanreversion_signal] Trade signal generated: {trade_signal}")
+    return trade_signal
+
+
+class MeanRevBot(BaseBot):
+    def __init__(self, name="meanreversion", signal_func=meanreversion_signal,
+                 fetch_candles=fetch_candles, place_trade=place_trade):
+        super().__init__(name, signal_func, fetch_candles, place_trade)
+        self.order = None
+
+    def close_trade(self, exit_price):
+        """Closes the trade and updates balance using only numeric profit."""
+        if isinstance(self.order, dict):
+            entry = self.order.get("entry_price")
+            size = self.order.get("position_size", 1)
+            direction = self.order.get("direction")
+
+            if entry is not None and isinstance(size, (int, float)):
+                if direction == "buy":
+                    profit = (exit_price - entry) * size
+                else:
+                    profit = (entry - exit_price) * size
+            else:
+                profit = 0
+
+            self.order["profit"] = round(profit, 2)
+            print(f"Trade closed at {exit_price}. Profit: {profit}. Order: {self.order}")
+            update_balance(self.order.get("profit", 0))
+            self.order = None
+
+
+if __name__ == "__main__":
+    MeanRevBot().run()
+
+
+───────────────────────────────────────────────
+📄 bots\scalping.py
+───────────────────────────────────────────────
+
+# SCALPING.PY – High-Frequency Scalping Bot for Monarch Suite
+
+import datetime
+import time
+import random
+import threading
+
+from base_bot import BaseBot
+from utils.execution import place_trade
+from utils.state     import get_balance, update_balance
+from utils.data      import fetch_candles
+from config          import MARKETS, RISK_PCT
+
+
+class ScalpingBot(BaseBot):
+    def __init__(self, name="scalping", signal_func=None, fetch_candles=fetch_candles, place_trade=place_trade):
+        super().__init__(
+            name=name,
+            signal_func=signal_func or self.generate_signal,
+            fetch_candles=fetch_candles,
+            place_trade=place_trade
+        )
+
+        self.account_balance           = get_balance()
+        self.risk_percentage           = 0.015
+        self.stop_loss_pips            = 3
+        self.profit_target_min_pips    = 6
+        self.profit_target_max_pips    = 15
+        self.pip_value                 = 0.0001
+        self.ema_period                = 9
+        self.atr_period                = 14
+
+        self.active_candidate = None
+        self.order            = None
+        self.candle_history   = []
+        self.price_history    = []
+        self.current_market   = None
+        self.lock             = threading.Lock()
+
+    def calculate_ema(self, prices, period):
+        if len(prices) == 0:
+            return None
+        alpha = 2 / (period + 1)
+        ema = prices[0]
+        for price in prices[1:]:
+            ema = alpha * price + (1 - alpha) * ema
+        return ema
+
+    def calculate_atr(self, candles, period):
+        if len(candles) < 2:
+            return 0
+        trs = []
+        for i in range(1, len(candles)):
+            high       = candles[i]['high']
+            low        = candles[i]['low']
+            prev_close = candles[i-1]['close']
+            tr = max(
+                high - low,
+                abs(high - prev_close),
+                abs(low - prev_close)
+            )
+            trs.append(tr)
+        return sum(trs[-period:]) / period if len(trs) >= period else sum(trs) / len(trs)
+
+    def is_trading_allowed(self, current_time):
+        forbidden_periods = [
+            (datetime.time(8, 0), datetime.time(8, 30)),
+            (datetime.time(13, 30), datetime.time(14, 0))
+        ]
+        now_t = current_time.time()
+        return not any(start <= now_t <= end for start, end in forbidden_periods)
+
+    def check_candle_for_candidate(self, candle):
+        candle_range = candle['high'] - candle['low']
+        if candle_range <= 0:
+            return None
+
+        upper_wick = candle['high'] - max(candle['open'], candle['close'])
+        lower_wick = min(candle['open'], candle['close']) - candle['low']
+
+        if upper_wick / candle_range >= 0.5:
+            return {'type': 'bearish', 'wick_tip': candle['high'], 'candle': candle}
+        if lower_wick / candle_range >= 0.5:
+            return {'type': 'bullish', 'wick_tip': candle['low'], 'candle': candle}
+        return None
+
+    def process_new_candle(self, candle, market):
+        self.candle_history.append(candle)
+        candidate = self.check_candle_for_candidate(candle)
+        if candidate:
+            self.active_candidate = candidate
+            self.current_market   = market
+            print(f"[{candle['time']}] New candidate detected ({market}): {candidate['type']} with wick tip at {candidate['wick_tip']}")
+
+    def process_live_price(self, price, current_time):
+        self.price_history.append(price)
+
+        if not self.is_trading_allowed(current_time):
+            return
+
+        if self.active_candidate and not self.order:
+            wick_tip  = self.active_candidate['wick_tip']
+            threshold = 2 * self.pip_value
+            if abs(price - wick_tip) <= threshold:
+                recent = self.price_history[-self.ema_period:]
+                ema    = self.calculate_ema(recent, self.ema_period)
+                direction = self.active_candidate['type']
+                if direction == 'bearish' and price < ema:
+                    self.enter_trade(direction, price, current_time)
+                elif direction == 'bullish' and price > ema:
+                    self.enter_trade(direction, price, current_time)
+                else:
+                    print(f"[{current_time}] EMA filter not confirmed. Price: {price}, EMA: {ema}")
+
+        if self.order:
+            self.update_trailing_stop(price)
+
+    def enter_trade(self, trade_direction, entry_price, current_time):
+        sl_dist = self.stop_loss_pips * self.pip_value
+        stop_loss = (entry_price + sl_dist) if trade_direction == 'bearish' else (entry_price - sl_dist)
+        take_profit = (entry_price - self.profit_target_min_pips * self.pip_value) if trade_direction == 'bearish' else (entry_price + self.profit_target_min_pips * self.pip_value)
+
+        risk_amount   = get_balance() * RISK_PCT
+        position_size = risk_amount / sl_dist
+
+        trade = place_trade(
+            market    = self.current_market,
+            direction = trade_direction,
+            size      = position_size,
+            sl        = stop_loss,
+            tp        = take_profit
+        )
+
+        if trade:
+            self.order = {
+                'direction':      trade_direction,
+                'entry_price':    trade['entry'],
+                'stop_loss':      stop_loss,
+                'take_profit':    take_profit,
+                'position_size':  position_size,
+                'entry_time':     current_time,
+                'ticket_id':      trade.get("ticket_id"),
+                'trailing_active': False
+            }
+            print(f"[{current_time}] Trade executed ({self.current_market}): {trade_direction} at {trade['entry']} | SL: {stop_loss} | TP: {take_profit} | Size: {position_size}")
+        else:
+            print(f"[{current_time}] Trade execution failed.")
+
+    def update_trailing_stop(self, current_price):
+        if not self.order:
+            return
+
+        entry    = self.order['entry_price']
+        sl       = self.order['stop_loss']
+        distance = abs(entry - sl)
+        profit   = (entry - current_price) if self.order['direction'] == 'bearish' else (current_price - entry)
+        threshold = 2 * distance
+
+        if self.order['direction'] == 'bearish' and profit > threshold:
+            new_sl = current_price + distance
+            if new_sl < sl:
+                self.order['stop_loss'] = new_sl
+                print(f"[{datetime.datetime.now()}] Trailing stop updated (bearish) to {new_sl}")
+
+        if self.order['direction'] == 'bullish' and profit > threshold:
+            new_sl = current_price - distance
+            if new_sl > sl:
+                self.order['stop_loss'] = new_sl
+                print(f"[{datetime.datetime.now()}] Trailing stop updated (bullish) to {new_sl}")
+
+    def close_trade(self, exit_price):
+        if isinstance(self.order, dict):
+            entry     = self.order.get("entry_price")
+            size      = self.order.get("position_size", 1)
+            direction = self.order.get("direction")
+
+            if entry is not None and isinstance(size, (int, float)):
+                if direction == "buy":
+                    profit = (exit_price - entry) * size
+                else:
+                    profit = (entry - exit_price) * size
+            else:
+                profit = 0
+
+            self.order["profit"] = round(profit, 2)
+            print(f"Trade closed at {exit_price}. Profit: {profit}. Order: {self.order}")
+            with self.lock:
+                update_balance(self.order.get("profit", 0))
+            self.order = None
+
+    def generate_signal(self, candles):
+        if not candles:
+            return None
+
+        last_candle = candles[-1]
+        candidate   = self.check_candle_for_candidate(last_candle)
+        if not candidate:
+            return None
+
+        direction = candidate['type']
+        wick_tip  = candidate['wick_tip']
+        sl_dist   = self.stop_loss_pips * self.pip_value
+        sl = wick_tip + sl_dist if direction == 'bearish' else wick_tip - sl_dist
+        tp = wick_tip - (self.profit_target_min_pips * self.pip_value) if direction == 'bearish' else wick_tip + (self.profit_target_min_pips * self.pip_value)
+
+        return {
+            "market":     last_candle.get("market", MARKETS[0]),
+            "direction":  direction,
+            "sl":         sl,
+            "tp":         tp,
+            "confidence": 90,
+            "reason":     "Scalping wick rejection"
+        }
+
+# ─── Module‐level signal for launcher.py to import ─────────────────
+def scalping_signal(candles):
+    bot = ScalpingBot()
+
+
+───────────────────────────────────────────────
+📄 bots\trend.py
+───────────────────────────────────────────────
+
+"""
+EMA-cross trend bot – v2.2 (live execution with safe trade entry)
+"""
+
+from base_bot import BaseBot
+from utils.data import fetch_candles
+from utils.execution import place_trade
+from utils.indicators import atr_pips
+from utils.state import get_balance, update_balance
+from config import ATR_PERIOD, CONFIDENCE_MIN_MOMENTUM, MARKETS, RISK_PCT
+
+
+def _ema_series(values, period):
+    """Return full EMA list matching `values` length."""
+    k = 2 / (period + 1)
+    ema_vals = [values[0]]  # Seed with first value
+    for price in values[1:]:
+        ema_vals.append(price * k + ema_vals[-1] * (1 - k))
+    return ema_vals
+
+
+def trend_signal(candles, higher_tf_candles=None, signal_params=None):
+    if len(candles) < 50:
+        return None
+
+    closes = [b["close"] for b in candles]
+    ema_fast = _ema_series(closes, 9)
+    ema_slow = _ema_series(closes, 21)
+
+    if ema_fast[-2] < ema_slow[-2] and ema_fast[-1] > ema_slow[-1]:
+        direction = "buy"
+    elif ema_fast[-2] > ema_slow[-2] and ema_fast[-1] < ema_slow[-1]:
+        direction = "sell"
+    else:
+        return None
+
+    last_close = closes[-1]
+    market_name = candles[0].get("market", MARKETS[0])
+    atr = atr_pips(market_name)
+    if atr is None or atr <= 0:
+        print(f"[trend_signal] ATR unavailable for {market_name}. Skipping trade.")
+        return None
+
+    # Calculate stop-loss and take-profit based on ATR multiples
+    sl = last_close - 1.5 * atr if direction == "buy" else last_close + 1.5 * atr
+    tp = last_close + 3.0 * atr if direction == "buy" else last_close - 3.0 * atr
+
+    trade_signal = {
+        "direction":  direction,
+        "entry":      last_close,
+        "sl":         round(sl, 2),
+        "tp":         round(tp, 2),
+        "confidence": CONFIDENCE_MIN_MOMENTUM,
+        "reason":     "EMA cross",
+        "market":     market_name,
+    }
+    print(f"[trend_signal] Trade signal generated: {trade_signal}")
+    return trade_signal
+
+
+class TrendBot(BaseBot):
+    def __init__(self, name="trend", signal_func=trend_signal, fetch_candles=fetch_candles, place_trade=place_trade):
+        super().__init__(name, signal_func, fetch_candles, place_trade)
+        self.order = None
+
+    def enter_trade(self, trade_signal, current_time):
+        if trade_signal is None:
+            return
+        direction = trade_signal.get("direction")
+        entry_price = trade_signal.get("entry")
+        stop_loss = trade_signal.get("sl")
+        take_profit = trade_signal.get("tp")
+        market = trade_signal.get("market")
+        if not all([direction, entry_price, stop_loss, take_profit, market]):
+            print(f"[{current_time}] Incomplete trade signal: {trade_signal}")
+            return
+
+        # Calculate risk amount and stop loss distance
+        risk_amount = get_balance() * RISK_PCT
+        sl_dist = abs(entry_price - stop_loss)
+        if sl_dist == 0:
+            print(f"[{current_time}] ERROR: Stop loss distance is zero. Aborting trade.")
+            return
+
+        position_size = risk_amount / sl_dist
+
+        trade = place_trade(
+            market=market,
+            direction=direction,
+            size=position_size,
+            sl=stop_loss,
+            tp=take_profit
+        )
+        if trade:
+            self.order = {
+                "direction": direction,
+                "entry_price": entry_price,
+                "stop_loss": stop_loss,
+                "take_profit": take_profit,
+                "position_size": position_size,
+                "entry_time": current_time,
+                "ticket_id": trade.get("ticket_id")
+            }
+            print(f"[{current_time}] Trade executed on {market}: {direction} at {entry_price} | SL: {stop_loss} | TP: {take_profit} | Size: {position_size}")
+        else:
+            print(f"[{current_time}] Trade execution failed.")
+
+    def close_trade(self, exit_price):
+        if not isinstance(self.order, dict):
+            return
+        entry = self.order.get("entry_price")
+        size = self.order.get("position_size", 1)
+        direction = self.order.get("direction")
+        if entry is None or size == 0:
+            print("Invalid order parameters. Order:", self.order)
+            return
+
+        profit = (exit_price - entry) * size if direction == "buy" else (entry - exit_price) * size
+        self.order["profit"] = round(profit, 2)
+        print(f"Trade closed at {exit_price}. Profit: {profit}. Order: {self.order}")
+        update_balance(self.order.get("profit", 0))
+        self.order = None
+
+    def run(self):
+        # Simple run loop: periodically fetch candles, generate signal, and attempt to enter a trade
+        import time
+        while True:
+            market = MARKETS[0]
+            candles = self.fetch_candles(market)
+            signal = self.signal_func(candles)
+            if signal:
+                self.enter_trade(signal, current_time=time.strftime("%Y-%m-%d %H:%M:%S"))
+            # Wait before next check (adjust as needed for your strategy)
+            time.sleep(60)
+
+
+if __name__ == "__main__":
+    TrendBot().run()
+
+
+───────────────────────────────────────────────
+📄 bots\wick.py
+───────────────────────────────────────────────
+
+"""
+IG – Wick-reversal strategy bot (self-contained, live execution)
+"""
+
+from base_bot import BaseBot
+from utils.data import fetch_candles
+from utils.execution import place_ig_order
+from utils.indicators import atr_pips
+from utils.state import update_balance
+from config import (
+    ATR_PERIOD,
+    ATR_MULTIPLIER_SL,
+    ATR_MULTIPLIER_TP,
+    CONFIDENCE_MIN_WICK,
+    WICK_RATIO,
+    MARKETS
+)
+
+
+def wick_signal(candles, higher_tf_candles=None, signal_params=None):
+    """
+    Detects long-wick reversals on the most recent candle.
+    Returns a dict with trade fields or None.
+    """
+    if len(candles) < 2:
+        return None
+
+    bar = candles[-1]
+    o, h, l, c = bar["open"], bar["high"], bar["low"], bar["close"]
+    body = abs(c - o)
+    range_ = h - l
+    if range_ == 0:
+        return None
+
+    upper_wick = h - max(o, c)
+    lower_wick = min(o, c) - l
+
+    market_name = bar.get("market", MARKETS[0])
+    atr = atr_pips(market_name)
+    if atr is None or atr <= 0:
+        print(f"[wick_signal] ATR unavailable for {market_name}. Skipping trade.")
+        return None
+
+    if lower_wick > WICK_RATIO * body and body / range_ < 0.3:
+        direction = "buy"
+        sl = l - ATR_MULTIPLIER_SL * atr
+        tp = c + ATR_MULTIPLIER_TP * atr
+    elif upper_wick > WICK_RATIO * body and body / range_ < 0.3:
+        direction = "sell"
+        sl = h + ATR_MULTIPLIER_SL * atr
+        tp = c - ATR_MULTIPLIER_TP * atr
+    else:
+        return None
+
+    trade_signal = {
+        "direction":  direction,
+        "entry":      c,
+        "sl":         round(sl, 2),
+        "tp":         round(tp, 2),
+        "confidence": CONFIDENCE_MIN_WICK,
+        "reason":     "wick reversal",
+        "market":     market_name,
+    }
+
+    print(f"[wick_signal] Trade signal generated: {trade_signal}")
+    return trade_signal
+
+
+class WickBot(BaseBot):
+    def __init__(self, name="wick", signal_func=wick_signal,
+                 fetch_candles=fetch_candles, place_trade=place_ig_order):
+        super().__init__(name, signal_func, fetch_candles, place_trade)
+        self.order = None
+
+    def close_trade(self, exit_price):
+        """
+        Closes the trade and updates balance using only numeric profit.
+        """
+        if isinstance(self.order, dict):
+            entry     = self.order.get("entry_price")
+            size      = self.order.get("position_size", 1)
+            direction = self.order.get("direction")
+
+            if entry is not None and isinstance(size, (int, float)):
+                if direction == "buy":
+                    profit = (exit_price - entry) * size
+                else:
+                    profit = (entry - exit_price) * size
+            else:
+                profit = 0
+
+            self.order["profit"] = round(profit, 2)  # Record it in case base_bot tries to use it
+            print(f"Trade closed at {exit_price}. Profit: {profit}. Order: {self.order}")
+            update_balance(self.order.get("profit", 0))  # Safely pass numeric only
+            self.order = None
+
+
+if __name__ == "__main__":
+    WickBot().run()
+
+
+───────────────────────────────────────────────
+📄 utils\New Text Document.txt
+───────────────────────────────────────────────
+
+
+
+
+───────────────────────────────────────────────
+📄 utils\__init__.py
+───────────────────────────────────────────────
+
+
+
+
+───────────────────────────────────────────────
+📄 utils\confidence.json
+───────────────────────────────────────────────
+
+85
+
+
+───────────────────────────────────────────────
+📄 utils\controller.py
+───────────────────────────────────────────────
+
+# utils/controller.py
+import threading
+from datetime import datetime, time as dtime
+import pytz
+from config import LONDON_TZ
+
+run_event = threading.Event()
+
+def in_restricted_time(bot_name: str) -> bool:
+    """
+    Returns True if the bot should be paused:
+    - All bots pause during 08:00–08:30 and 13:30–14:00 (London time)
+    - All bots except 'scalping' pause outside 08:00–17:00
+    """
+    try:
+        now = datetime.now(pytz.timezone(LONDON_TZ)).time()
+    except Exception as e:
+        print(f"[controller] Timezone error: {e}")
+        return True  # fail-safe to block trading if clock breaks
+
+    # Opening windows (30-min post-open cooldowns)
+    london_open     = dtime(8, 0)
+    london_block    = dtime(8, 30)
+
+    ny_open         = dtime(13, 30)
+    ny_block        = dtime(14, 0)
+
+    in_open_window = (london_open <= now < london_block) or (ny_open <= now < ny_block)
+
+    # Full session window for standard bots
+    session_start   = dtime(8, 0)
+    session_end     = dtime(17, 0)
+    in_session      = session_start <= now <= session_end
+
+    if bot_name.lower() == "scalping":
+        return in_open_window  # scalping ignores full session hours
+    else:
+        return in_open_window or not in_session
+
+
+───────────────────────────────────────────────
+📄 utils\correlation.py
+───────────────────────────────────────────────
+
+# utils/correlation.py
+def compute_correlation(data1,data2):
+    return 0.0
+
+
+
+───────────────────────────────────────────────
+📄 utils\data.py
+───────────────────────────────────────────────
+
+"""
+utils/data.py – Universal candle-fetcher wrapper.
+"""
+
+import requests
+from config import IG_API_BASE_URL, IG_APP_KEY, IG_ACCOUNT_ID, DEBUG_MODE
+
+# Define safe defaults supported by the IG API.
+DEFAULT_RESOLUTION = "HOUR"       # Instead of "1Min"
+DEFAULT_NUM_CANDLES = 200
+
+def fetch_candles(market: str, timeframe: str = DEFAULT_RESOLUTION, num: int = DEFAULT_NUM_CANDLES, *args, **kwargs):
+    # Allow overriding of timeframe and count via keyword arguments.
+    # If no resolution is provided, it now defaults to "HOUR"
+    timeframe = kwargs.get("resolution", timeframe)
+    num = kwargs.get("count", kwargs.get("num", num))
+    
+    # Always attempt to fetch live candles; if the call fails, an exception is raised.
+    return _fetch_candles_ig_rest(market, timeframe, num)
+
+def _fetch_candles_ig_rest(market: str, timeframe: str, num: int):
+    # IMPORTANT: Pass the resolution as a query parameter.
+    url = f"{IG_API_BASE_URL}/prices/{market}?resolution={timeframe}&max={num}"
+    headers = {
+        "X-IG-API-KEY": IG_APP_KEY,  # Use IG_APP_KEY from your config
+        "Version": "3",
+        "Accept": "application/json"
+    }
+    
+    # Make the HTTP GET request to the IG API.
+    response = requests.get(url, headers=headers, timeout=10)
+    response.raise_for_status()  # Raises HTTPError if the status is not 200
+    
+    # Process the JSON response. A successful call should contain a "prices" key.
+    data = response.json()
+    prices = data["prices"]
+    
+    candles = []
+    for bar in prices:
+        candles.append({
+            "time": bar["snapshotTime"],
+            "open": bar["openPrice"]["ask"],
+            "high": bar["highPrice"]["ask"],
+            "low":  bar["lowPrice"]["ask"],
+            "close": bar["closePrice"]["ask"]
+        })
+    return candles
+
+
+───────────────────────────────────────────────
+📄 utils\data_fetcher.py
+───────────────────────────────────────────────
+
+# utils/data_fetcher.py
+import requests, os, json
+from config import IG_API_BASE_URL, IG_APP_KEY, IG_USERNAME, IG_PASSWORD
+
+LOGIN_ENDPOINT = f"{IG_API_BASE_URL}/session"
+
+def get_session() -> requests.Session:
+    """Login to IG, return an authorised Session."""
+    s = requests.Session()
+    s.headers.update({
+        "X-IG-API-KEY": IG_APP_KEY,
+        "Content-Type": "application/json; charset=UTF-8",
+        "Accept": "application/json; charset=UTF-8"
+    })
+    payload = {
+        "identifier": IG_USERNAME,
+        "password":   IG_PASSWORD
+    }
+    r = s.post(LOGIN_ENDPOINT, json=payload)
+    r.raise_for_status()
+    oauth = r.json()
+    cst = r.headers["CST"]
+    sst = r.headers["X-SECURITY-TOKEN"]
+    s.headers.update({"CST": cst, "X-SECURITY-TOKEN": sst})
+    return s
+
+
+───────────────────────────────────────────────
+📄 utils\emailer.py
+───────────────────────────────────────────────
+
+# utils/emailer.py
+"""Outbound e-mail utilities for Trade Command Monarch.
+
+Features
+--------
+• Auto-detect TLS (587) vs SSL (465)
+• Graceful no-op when SMTP creds are absent
+• Multipart (plain + HTML)
+• Helpers: trade placed/closed, bot online/offline, daily & weekly summaries
+"""
+
+import logging, smtplib, ssl
+from email.message import EmailMessage
+from datetime import datetime
+import pytz
+
+from config import (
+    SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS,
+    TRADE_ALERT_EMAIL, MARKETS, LONDON_TZ
+)
+from utils.journal import read_daily_pnl
+
+# ──────────────────────────────────────────────────────────
+# constants
+# ──────────────────────────────────────────────────────────
+SMTP_CONFIG = dict(
+    host=SMTP_HOST or "",
+    port=int(SMTP_PORT or 0),
+    user=SMTP_USER or "",
+    pwd = SMTP_PASS or "",
+)
+
+RECIPIENTS = [e.strip() for e in TRADE_ALERT_EMAIL.split(",") if e.strip()]
+LONDON     = pytz.timezone(LONDON_TZ)
+
+# ──────────────────────────────────────────────────────────
+# core sender
+# ──────────────────────────────────────────────────────────
+def _send_email(subject: str, text: str, html: str | None = None) -> None:
+    """Push a multipart message; skip quietly if SMTP not configured."""
+    if not (SMTP_CONFIG["host"] and SMTP_CONFIG["port"]
+            and SMTP_CONFIG["user"] and SMTP_CONFIG["pwd"] and RECIPIENTS):
+        logging.warning("[emailer] SMTP not configured – \"%s\" suppressed", subject)
+        return
+
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"]    = SMTP_CONFIG["user"]
+    msg["To"]      = ", ".join(RECIPIENTS)
+    msg.set_content(text)
+    if html:
+        msg.add_alternative(html, subtype="html")
+
+    try:
+        if SMTP_CONFIG["port"] == 465:          # implicit SSL
+            context = ssl.create_default_context()
+            with smtplib.SMTP_SSL(SMTP_CONFIG["host"], 465, context=context) as s:
+                s.login(SMTP_CONFIG["user"], SMTP_CONFIG["pwd"])
+                s.send_message(msg)
+        else:                                   # default: start-TLS
+            with smtplib.SMTP(SMTP_CONFIG["host"], SMTP_CONFIG["port"]) as s:
+                s.starttls()
+                s.login(SMTP_CONFIG["user"], SMTP_CONFIG["pwd"])
+                s.send_message(msg)
+        logging.info("[emailer] sent \"%s\"", subject)
+    except Exception as exc:
+        logging.error("[emailer] failed \"%s\": %s", subject, exc, exc_info=True)
+
+# ──────────────────────────────────────────────────────────
+# helpers
+# ──────────────────────────────────────────────────────────
+def _weekday_london() -> bool:
+    return datetime.now(LONDON).weekday() < 5
+
+# ---------- trade placed ----------
+def send_trade_placed_email(market, direction, size, sl, tp, confidence, strategy):
+    subj  = f"[Monarch] New {strategy} trade on {market}"
+    entry = (sl + tp) / 2
+    text  = (
+        "Hi Adrian,\n\n"
+        f"We placed a {strategy} {direction} trade on {market}.\n"
+        f"Size: £{size}  Entry: {entry:.2f}  SL: {sl}  TP: {tp}\n"
+        f"Confidence: {confidence}/100\n\nGood luck!\n— TCM"
+    )
+    html  = f"""
+    <p>Hi Adrian,</p>
+    <p>We placed a <b>{strategy}</b> <b>{direction}</b> trade on <b>{market}</b>.</p>
+    <ul>
+      <li>Size: £{size}</li><li>Entry: {entry:.2f}</li>
+      <li>Stop-Loss: {sl}</li><li>Take-Profit: {tp}</li>
+      <li>Confidence: {confidence}/100</li>
+    </ul>
+    <p>Good luck! — TCM</p>
+    """
+    _send_email(subj, text, html)
+
+# ---------- trade closed (fixed) ----------
+def send_trade_outcome_email(market, direction, entry_price, exit_price, profit):
+    won           = profit >= 0
+    outcome_txt   = "in profit" if won else "at a loss"
+    label         = "Profit" if won else "Loss"
+    flair         = "Great job!" if won else "On to the next."
+    subj          = f"[Monarch] Trade {'WIN' if won else 'loss'} on {market}"
+
+    text = (
+        "Hi Adrian,\n\n"
+        f"Your {direction} trade on {market} closed {outcome_txt}.\n"
+        f"Entry: {entry_price}\nExit:  {exit_price}\n"
+        f"{label}: £{abs(profit):.2f}\n\n{flair} — TCM"
+    )
+
+    html = f"""
+    <p>Hi Adrian,</p>
+    <p>Your <b>{direction}</b> trade on <b>{market}</b> closed
+       <b>{outcome_txt}</b>.</p>
+    <ul>
+      <li>Entry: {entry_price}</li>
+      <li>Exit:  {exit_price}</li>
+      <li>{label}: £{abs(profit):.2f}</li>
+    </ul>
+    <p>{flair} — TCM</p>
+    """
+
+    _send_email(subj, text, html)
+
+# ---------- bots online / offline ----------
+def send_bot_online_email():
+    if _weekday_london():
+        subj = "[Monarch] Bots ONLINE"
+        _send_email(subj,
+                    "Hi Adrian,\n\nBots started.\n— TCM",
+                    f"<p>Bots started. Monitoring: {', '.join(MARKETS)}</p>")
+
+def send_bot_offline_email():
+    if _weekday_london():
+        subj = "[Monarch] Bots OFFLINE"
+        _send_email(subj,
+                    "Hi Adrian,\n\nBots stopped.\n— TCM",
+                    "<p>Bots stopped. See you next session!</p>")
+
+# ---------- crash ----------
+def send_crash_email(error_message):
+    _send_email("[Monarch] Bot exception", str(error_message))
+
+# ---------- summaries ----------
+def send_daily_summary_email():
+    if not _weekday_london(): return
+    now = datetime.now(LONDON).strftime("%Y-%m-%d")
+    _send_email(f"[Monarch] Daily summary {now}", read_daily_pnl())
+
+def send_weekly_summary_email():
+    now = datetime.now(LONDON).strftime("%Y-%m-%d")
+    _send_email(f"[Monarch] Weekly summary {now}", read_daily_pnl())  # TODO: weekly agg
+
+
+───────────────────────────────────────────────
+📄 utils\execution.py
+───────────────────────────────────────────────
+
+"""
+utils/execution.py - Live IG order placement with Spread Betting support + legacy alias
+"""
+
+import random
+import requests
+from typing import Optional
+
+from config import IG_API_BASE_URL, IG_APP_KEY, IG_ACCOUNT_ID, DEBUG_MODE
+from utils.trade_executor import get_live_ig_balance
+from utils.ig_auth import ig_login
+
+# Global variable to cache authentication tokens.
+security_tokens = None
+
+def get_security_tokens():
+    global security_tokens
+    if security_tokens is None:
+        security_tokens = ig_login()
+    return security_tokens
+
+def place_ig_order(market: str, direction: str, size: float, sl: float, tp: float):
+    """
+    Sends a MARKET order to IG.
+    
+    In live mode (DEBUG_MODE=False), this places a real order.
+    
+    Parameters:
+      - market (str): The instrument epic (e.g. "CS.D.NAS100.SPREADB.IP" for Spread Betting)
+      - direction (str): "buy" or "sell" (will be uppercased)
+      - size (float): Trade size
+      - sl (float): Stop-loss level
+      - tp (float): Take-profit level
+      
+    Returns:
+      dict: A dictionary containing order details.
+    """
+    if DEBUG_MODE or not (IG_APP_KEY and IG_ACCOUNT_ID):
+        return _dummy_fill(direction)
+    return _ig_rest_place(market, direction, size, sl, tp)
+
+# Legacy alias for backward compatibility.
+place_trade = place_ig_order
+
+def _ig_rest_place(market: str, direction: str, size: float, sl: float, tp: float):
+    tokens = get_security_tokens()
+    
+    # For Spread Betting orders, include "expiry" and "currencyCode".
+    if "SPREADB" in market.upper():
+        endpoint = "positions"
+        payload = {
+            "epic": market,
+            "expiry": "DFB",             # Required for spread betting orders
+            "direction": direction.upper(),
+            "size": str(size),           # Send as string per IG requirements
+            "orderType": "MARKET",
+            "timeInForce": "FILL_OR_KILL",
+            "currencyCode": "GBP",       # Include currency even for spread bets
+            "slLevel": str(sl),
+            "tpLevel": str(tp)
+        }
+    else:
+        endpoint = "positions/otc"
+        payload = {
+            "epic": market,
+            "direction": direction.upper(),
+            "size": str(size),
+            "orderType": "MARKET",
+            "timeInForce": "FILL_OR_KILL",
+            "slLevel": str(sl),
+            "tpLevel": str(tp),
+            "currencyCode": "GBP"
+        }
+    
+    url = f"{IG_API_BASE_URL}/{endpoint}"
+    print("DEBUG: Market epic:", market, "using endpoint:", url)
+    print("DEBUG: Sending order payload:", payload)
+    
+    headers = {
+        "X-IG-API-KEY": IG_APP_KEY,
+        "X-IG-ACCOUNT-ID": IG_ACCOUNT_ID,  # Ensure you're using your spread betting account here
+        "Version": "3",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "CST": tokens.get("CST", ""),
+        "X-SECURITY-TOKEN": tokens.get("X-SECURITY-TOKEN", "")
+    }
+    
+    # Post to IG API
+    response = requests.post(url, headers=headers, json=payload, timeout=10)
+    response.raise_for_status()
+    data = response.json()
+    live_balance = get_live_ig_balance()
+    
+    return {
+        "entry": data.get("dealReference", 0.0),
+        "ticket_id": data.get("dealId", ""),
+        "pnl": 0.0,
+        "balance": live_balance,
+        "error": None
+    }
+
+def _dummy_fill(direction: str, error: Optional[str] = None):
+    price = 7000 + random.uniform(-50, 50)
+    ticket = f"DUMMY-{random.randint(10000, 99999)}"
+    live_balance = get_live_ig_balance()
+    return {
+        "entry": round(price, 2),
+        "ticket_id": ticket,
+        "pnl": 0.0,
+        "balance": live_balance,
+        "error": error
+    }
+
+
+───────────────────────────────────────────────
+📄 utils\file_utils.py
+───────────────────────────────────────────────
+
+# utils/file_utils.py
+import json, shutil, tempfile, os
+
+def atomic_write_json(data: dict, path: str):
+    """
+    Write JSON atomically so bots never read a half-written file.
+    Works on Windows (NTFS) and Linux.
+    """
+    folder = os.path.dirname(path) or "."
+    with tempfile.NamedTemporaryFile("w", delete=False, dir=folder) as tmp:
+        json.dump(data, tmp)
+    shutil.move(tmp.name, path)          # atomic rename
+
+
+───────────────────────────────────────────────
+📄 utils\filters.py
+───────────────────────────────────────────────
+
+from datetime import datetime
+from pytz import timezone
+import numpy as np
+
+from config import (
+    MOMENTUM_THRESHOLD, WICK_RATIO, CONFIDENCE_MIN_MOMENTUM, CONFIDENCE_MIN_WICK,
+    LONDON_TZ
+)
+
+from utils.controller import in_restricted_time  # Central time logic now used here
+
+
+# ── Individual Filter Logic ─────────────────────────────────────────────
+
+def volatility_filter(atr, min_atr=0.5, max_atr=20):
+    return min_atr < atr < max_atr
+
+def momentum_filter(momentum):
+    return abs(momentum) > MOMENTUM_THRESHOLD
+
+def wick_filter(wick_ratio):
+    return wick_ratio > WICK_RATIO
+
+def exposure_filter(state, bot, max_trades):
+    open_trades = state.get_open_trades(bot)
+    return len(open_trades) < max_trades
+
+def multi_timeframe_trend_filter(curr_tf_trend, higher_tf_trend):
+    return curr_tf_trend == higher_tf_trend
+
+def confidence_score(signal):
+    """
+    Assigns confidence score (1–100) based on signal fields.
+    Fields: 'momentum', 'wick_ratio', 'trend_agreement', 'atr'
+    """
+    score = 50
+    score += min(30, abs(signal.get("momentum", 0)) * 100 / MOMENTUM_THRESHOLD) \
+        if abs(signal.get("momentum", 0)) > MOMENTUM_THRESHOLD else 0
+    score += 10 if signal.get("wick_ratio", 0) > WICK_RATIO else 0
+    score += 10 if signal.get("trend_agreement", False) else 0
+
+    atr = signal.get("atr", 0)
+    if 1 < atr < 10:
+        score += 5
+    elif atr < 0.5 or atr > 20:
+        score -= 10
+
+    return max(1, min(100, int(score)))
+
+
+# ── Composite Signal Gate ───────────────────────────────────────────────
+
+def filter_signal(signal, state, bot, max_trades, now=None):
+    """
+    Applies all filters and returns dict:
+    {
+        'passed': bool,
+        'confidence': int,
+        'explanation': str
+    }
+    """
+    reasons = []
+
+    # Time filter (centralized to controller.py)
+    if in_restricted_time(bot):
+        reasons.append("Restricted trading window (e.g. session closed or market open cooldown)")
+
+    if not volatility_filter(signal.get("atr", 0)):
+        reasons.append("ATR volatility out of range.")
+    if not momentum_filter(signal.get("momentum", 0)):
+        reasons.append("Momentum too low.")
+    if not wick_filter(signal.get("wick_ratio", 0)):
+        reasons.append("Wick ratio too low.")
+    if not exposure_filter(state, bot, max_trades):
+        reasons.append("Max open trades for bot reached.")
+    if not multi_timeframe_trend_filter(signal.get("trend"), signal.get("trend_higher")):
+        reasons.append("Trend mismatch with higher timeframe.")
+
+    conf = confidence_score(signal)
+
+    return {
+        "passed": len(reasons) == 0,
+        "confidence": conf,
+        "explanation": "; ".join(reasons) if reasons else "All filters passed."
+    }
+
+
+# ── Signal Placeholders (can be removed in prod if defined elsewhere) ──
+
+def trend_signal(candles, higher_tf_candles, signal_params):
+    return {
+        "momentum": signal_params.get("momentum", 0),
+        "wick_ratio": signal_params.get("wick_ratio", 0),
+        "trend": "up",
+        "trend_higher": "up",
+        "atr": signal_params.get("atr", 1.5),
+        "trend_agreement": True
+    }
+
+def meanreversion_signal(candles, higher_tf_candles, signal_params):
+    return {
+        "momentum": signal_params.get("momentum", 0),
+        "wick_ratio": signal_params.get("wick_ratio", 0),
+        "trend": "down",
+        "trend_higher": "down",
+        "atr": signal_params.get("atr", 1.2),
+        "trend_agreement": True
+    }
+
+meanrev_signal = meanreversion_signal
+
+def wick_signal(candles, higher_tf_candles, signal_params):
+    return {
+        "momentum": signal_params.get("momentum", 0),
+        "wick_ratio": signal_params.get("wick_ratio", 2.1),
+        "trend": "up",
+        "trend_higher": "up",
+        "atr": signal_params.get("atr", 0.9),
+        "trend_agreement": True
+    }
+
+def breakout_signal(candles, higher_tf_candles, signal_params):
+    return {
+        "momentum": signal_params.get("momentum", 1.8),
+        "wick_ratio": signal_params.get("wick_ratio", 0.7),
+        "trend": "up",
+        "trend_higher": "up",
+        "atr": signal_params.get("atr", 2.2),
+        "trend_agreement": True
+    }
+
+
+───────────────────────────────────────────────
+📄 utils\health_check.py
+───────────────────────────────────────────────
+
+import time
+import json
+import os
+from utils.stream_fetcher import start_streaming
+from utils.filters import momentum_logic_passed, wick_rejection_logic_passed, trend_continuation_logic_passed
+
+CONFIDENCE_FILE = "confidence.json"
+DEFAULT_CONFIDENCE = 85  # Default confidence for trades
+
+def check_health():
+    """
+    Checks the health of the system (e.g., if bots are alive).
+    """
+    print("Checking system health...")
+
+def get_confidence_threshold():
+    """
+    Fetch the current global confidence threshold from confidence.json (dashboard slider).
+    """
+    if not os.path.exists(CONFIDENCE_FILE):
+        set_confidence_threshold(DEFAULT_CONFIDENCE)
+        return DEFAULT_CONFIDENCE
+    try:
+        with open(CONFIDENCE_FILE, "r") as f:
+            data = json.load(f)
+            return int(data.get("confidence", DEFAULT_CONFIDENCE))
+    except Exception:
+        return DEFAULT_CONFIDENCE
+
+def set_confidence_threshold(value):
+    """
+    Set the global confidence threshold for bots and persist to confidence.json.
+    """
+    try:
+        with open(CONFIDENCE_FILE, "w") as f:
+            json.dump({"confidence": int(value)}, f)
+    except Exception:
+        pass  # Optionally add logging here
+
+def record_bot_heartbeat(bot_name):
+    """
+    Record heartbeat for each bot (used for monitoring).
+    """
+    print(f"❤️ {bot_name} heartbeat recorded!")
+
+def update_confidence_threshold(new_threshold):
+    """
+    Update the confidence threshold in the system.
+    """
+    set_confidence_threshold(new_threshold)
+    print(f"✅ Updated confidence threshold to {new_threshold}")
+
+
+───────────────────────────────────────────────
+📄 utils\ig_account.py
+───────────────────────────────────────────────
+
+import requests
+from config import IG_API_BASE_URL, IG_APP_KEY, IG_ACCOUNT_ID, IG_USERNAME, IG_PASSWORD
+
+def ig_login():
+    """Login to IG and return headers with session tokens."""
+    url = f"{IG_API_BASE_URL}/session"
+    data = {
+        "identifier": IG_USERNAME,
+        "password": IG_PASSWORD
+    }
+    headers = {
+        "X-IG-API-KEY": IG_APP_KEY,
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+    }
+    resp = requests.post(url, json=data, headers=headers)
+    resp.raise_for_status()
+    resp_headers = resp.headers
+    security_token = resp_headers.get("X-SECURITY-TOKEN")
+    cst_token = resp_headers.get("CST")
+    headers.update({
+        "X-SECURITY-TOKEN": security_token,
+        "CST": cst_token,
+        "Version": "2"
+    })
+    return headers
+
+def get_ig_account_balance():
+    """Fetch live account balance from IG."""
+    headers = ig_login()
+    url = f"{IG_API_BASE_URL}/accounts"
+    resp = requests.get(url, headers=headers)
+    resp.raise_for_status()
+    accounts = resp.json()["accounts"]
+    for acc in accounts:
+        if acc["accountId"] == IG_ACCOUNT_ID:
+            return float(acc["balance"]["available"])
+    raise Exception("IG account ID not found.")
+
+
+───────────────────────────────────────────────
+📄 utils\ig_auth.py
+───────────────────────────────────────────────
+
+import requests
+from config import IG_API_BASE_URL, IG_APP_KEY, IG_USERNAME, IG_PASSWORD
+
+def ig_login():
+    url = f"{IG_API_BASE_URL}/session"
+    headers = {
+        "X-IG-API-KEY": IG_APP_KEY,
+        "Accept": "application/json",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "identifier": IG_USERNAME,
+        "password": IG_PASSWORD
+    }
+    
+    response = requests.post(url, headers=headers, json=payload, timeout=10)
+    print("[IG_LOGIN] Status Code:", response.status_code)
+    print("[IG_LOGIN] Response Headers:", response.headers)
+    
+    try:
+        json_response = response.json()
+        print("[IG_LOGIN] JSON Response:", json_response)
+    except Exception as e:
+        print("[IG_LOGIN] No valid JSON response:", e)
+        json_response = {}
+
+    response.raise_for_status()
+    tokens = {
+        "CST": response.headers.get("CST"),
+        "X-SECURITY-TOKEN": response.headers.get("X-SECURITY-TOKEN")
+    }
+    print("[IG_LOGIN] Tokens received:", tokens)
+    
+    # Return both tokens and the full login JSON
+    return {"tokens": tokens, "login_json": json_response}
+
+if __name__ == "__main__":
+    result = ig_login()
+    print("Logged in. Tokens:", result["tokens"])
+    print("Login JSON:", result["login_json"])
+
+
+───────────────────────────────────────────────
+📄 utils\indicators.py
+───────────────────────────────────────────────
+
+"""
+utils/indicators.py
+Light-weight technical indicators with ZERO external dependencies.
+If you later install pandas / numpy, you can swap in faster versions.
+"""
+
+import statistics
+from typing import List, Dict
+
+
+# ---------------------------------------------------------------------------
+#  Helper: true range
+# ---------------------------------------------------------------------------
+def _true_range(curr: Dict, prev_close: float) -> float:
+    """
+    True Range for one candle.
+    `curr`  = dict with 'high', 'low', 'close'.
+    """
+    return max(
+        curr["high"] - curr["low"],
+        abs(curr["high"] - prev_close),
+        abs(curr["low"] - prev_close),
+    )
+
+
+# ---------------------------------------------------------------------------
+#  ATR in pips (or points) – PURE PYTHON
+# ---------------------------------------------------------------------------
+def atr_pips(market: str, lookback: int = 14) -> float:
+    """
+    Return Average True Range for the last `lookback` candles.
+    Falls back to 1 if not enough data so the risk module never divides by 0.
+
+    Requires `utils.data.fetch_candles()` to return a list of candles:
+    [
+        {"high": 7752.1, "low": 7701.2, "close": 7720.4},
+        ...
+    ]
+    """
+    from utils.data import fetch_candles
+
+    candles: List[Dict] = fetch_candles(market, num=lookback + 1)
+    if len(candles) < lookback + 1:
+        return 1.0  # safety fallback
+
+    trs = []
+    for i in range(1, len(candles)):
+        tr = _true_range(candles[i], candles[i - 1]["close"])
+        trs.append(tr)
+
+    return round(statistics.mean(trs), 4) or 1.0
+
+
+# ---------------------------------------------------------------------------
+#  Additional stubs – add real math later
+# ---------------------------------------------------------------------------
+def rsi(values: List[float], period: int = 14) -> float:
+    """Very basic RSI stub (returns 50). Implement properly if needed."""
+    return 50.0
+
+
+def ema(values: List[float], period: int = 20) -> float:
+    """Simple EMA stub (returns last value)."""
+    return values[-1] if values else 0.0
+
+
+───────────────────────────────────────────────
+📄 utils\journal.py
+───────────────────────────────────────────────
+
+# utils/journal.py
+import csv
+from datetime import datetime
+
+LOG_FILE = "trade_command_pro_log.csv"
+
+def log_trade(market,direction,sl,tp,confidence,strategy):
+    with open(LOG_FILE,'a',newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow([datetime.now(),market,direction,sl,tp,confidence,strategy])
+
+def trade_has_closed(deal_ref):
+    return True
+
+def get_trade_details(deal_ref):
+    return ("NAS100","LONG",1000.0,1010.0,50.0)
+
+def read_daily_pnl():
+    return "Daily P/L summary not implemented."
+
+
+
+───────────────────────────────────────────────
+📄 utils\news_filter.py
+───────────────────────────────────────────────
+
+# utils/news_filter.py
+def is_news_halt():
+    return False
+
+
+
+───────────────────────────────────────────────
+📄 utils\risk.py
+───────────────────────────────────────────────
+
+"""
+Volatility-adjusted position sizing.
+size = balance * risk_pct / stop_distance
+"""
+
+import math
+from typing import Dict
+
+from config import RISK_PCT, DEFAULT_BALANCE
+from utils.state import get_balance
+from utils.indicators import atr_pips  # hypothetical helper; ensure it exists
+
+
+def size_position(signal: Dict, market: str) -> float:
+    """
+    Returns the number of contracts / £ per point.
+    Assumes `signal["sl"]` already in price units.
+    """
+    balance = get_balance() if callable(get_balance) else DEFAULT_BALANCE
+    stop_distance = abs(signal["entry"] - signal["sl"])
+    if stop_distance == 0:
+        return 0.0
+
+    # risk = balance * risk_pct  (e.g. 1 %)
+    risk_money = balance * RISK_PCT
+    size = risk_money / stop_distance
+
+    # sanity cap: do not exceed 5 × mean ATR position
+    atr = atr_pips(market)
+    max_size = (balance * 0.05) / atr if atr else size
+    return round(min(size, max_size), 2)
+
+
+───────────────────────────────────────────────
+📄 utils\safe_api.py
+───────────────────────────────────────────────
+
+"""
+utils/safe_api.py – Wrappers for making IG API calls safely with retries
+"""
+
+import time
+from config import (
+    IG_API_BASE_URL,
+    IG_APP_KEY,
+    IG_USERNAME,
+    IG_PASSWORD,
+    IG_ACCOUNT_ID,
+    MARKETS
+)
+from utils.data import fetch_candles
+
+MAX_RETRIES = 3
+RETRY_DELAY = 2  # seconds
+
+# Use a supported resolution for verification.
+# If your config had CANDLE_RESOLUTION set to "1Min", override it here with a supported string.
+SUPPORT_RESOLUTION = "HOUR"
+
+def safe_api_call(func, kwargs: dict, bot_name: str, context: str):
+    """
+    Calls `func(**kwargs)` with retry logic.
+    On failure, logs and returns None.
+    """
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            return func(**kwargs)
+        except (Exception, TypeError) as e:
+            print(f"[{bot_name.upper()}][{context}] Attempt {attempt} failed: {e}")
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_DELAY * attempt)
+    print(f"[{bot_name.upper()}][{context}] All {MAX_RETRIES} attempts failed.")
+    return None
+
+def verify_ig_login() -> bool:
+    """
+    Verifies IG API credentials by attempting to fetch a candle.
+    Provides confirmation and fallback info for troubleshooting.
+    """
+    test_market = MARKETS[0]
+    print(f"🔄 Checking IG API login with {test_market}...")
+
+    result = safe_api_call(
+        fetch_candles,
+        kwargs={
+            "market":    test_market,
+            "timeframe": SUPPORT_RESOLUTION,  # Use supported resolution (e.g., "HOUR")
+            "num":       1
+        },
+        bot_name="launcher",
+        context="verify_login"
+    )
+
+    if result:
+        print(f"✅ IG login confirmed. Candle fetched from {test_market}.")
+        return True
+    else:
+        print(f"❌ IG login failed. No candles returned for {test_market}. Check credentials or API availability.")
+        return False
+
+
+───────────────────────────────────────────────
+📄 utils\session.py
+───────────────────────────────────────────────
+
+# utils/session.py
+
+# Paste in your live session tokens from your login response
+CST = "63208fee05ff93753aa1ee0ec3abc7a6c46e7ae39612820dda22e9cd724561CC01112"
+X_SECURITY_TOKEN = "1843f5891d8c98c17a48a62663310b4b5a340b5d853c504db3de52710d10d2CD01113"
+
+
+───────────────────────────────────────────────
+📄 utils\session_timer.py
+───────────────────────────────────────────────
+
+# utils/session_timer.py
+from datetime import datetime
+def is_trading_session():
+    now = datetime.utcnow()
+    total = now.hour*60 + now.minute
+    return (510 <= total <= 660) or (870 <= total <= 1020)
+
+
+
+───────────────────────────────────────────────
+📄 utils\state.py
+───────────────────────────────────────────────
+
+"""
+utils/state.py – Tracks account balance and enforces max drawdown
+"""
+
+import threading
+import requests
+from utils.safe_api import safe_api_call
+from config import (
+    IG_API_BASE_URL,
+    IG_APP_KEY,
+    RISK_PCT,
+    MAX_TOTAL_DAILY_DRAWDOWN_PCT
+)
+
+_balance_lock = threading.Lock()
+_last_balance = None
+
+def get_auth_headers():
+    """
+    Retrieve authentication headers (CST, X-SECURITY-TOKEN, API key) from your stored session.
+    """
+    from utils.session import CST, X_SECURITY_TOKEN
+    return {
+        "X-IG-API-KEY": IG_APP_KEY,
+        "CST": CST,
+        "X-SECURITY-TOKEN": X_SECURITY_TOKEN,
+        "Accept": "application/json",
+        "Content-Type": "application/json"
+    }
+
+def _fetch_account_details():
+    url = f"{IG_API_BASE_URL}/accounts"
+
+    def request_func(url):
+        try:
+            resp = requests.get(url, headers=get_auth_headers())
+            print(f"[STATE][debug] HTTP {resp.status_code} from {url}")
+            if resp.status_code == 200:
+                return resp.json()
+            else:
+                print(f"[STATE][error] Unexpected response: {resp.text}")
+                return None
+        except Exception as e:
+            print(f"[STATE][fetch_account] Exception: {e}")
+            return None
+
+    return safe_api_call(
+        func=request_func,
+        kwargs={"url": url},
+        bot_name="state",
+        context="fetch_account"
+    )
+
+def get_balance():
+    """
+    Safely fetches the balance from the preferred IG account.
+    Falls back to last known if parsing fails.
+    """
+    global _last_balance
+    data = _fetch_account_details()
+
+    if data and "accounts" in data:
+        preferred = next((a for a in data["accounts"] if a.get("preferred")), None)
+        bal = preferred.get("balance") if preferred else None
+
+        if bal is not None:
+            try:
+                # If the balance is a dictionary, try to extract its numeric value.
+                if isinstance(bal, dict):
+                    # For example, if bal looks like {"value": "1000.50", "currency": "GBP"}
+                    bal = float(bal.get("value", 0))
+                else:
+                    bal = float(bal)
+            except Exception as ex:
+                print(f"[state.py] ERROR: Couldn't convert balance to float: {ex}")
+                return _last_balance
+            with _balance_lock:
+                _last_balance = bal
+            return bal
+        else:
+            print("[state.py] WARNING: Preferred account balance not found.")
+            return _last_balance
+
+    print("[state.py] WARNING: No account data returned.")
+    return _last_balance
+
+def update_balance(delta):
+    """
+    Applies a profit/loss delta to our tracked balance.
+    Ensures that non-numeric deltas are not applied.
+    """
+    global _last_balance
+    try:
+        numeric_delta = float(delta)
+    except (TypeError, ValueError) as e:
+        print(f"[state.py] WARNING: update_balance called with non-numeric delta: {delta}")
+        return _last_balance
+
+    with _balance_lock:
+        if _last_balance is not None:
+            try:
+                _last_balance = float(_last_balance) + numeric_delta
+            except Exception as e:
+                print(f"[state.py] ERROR updating balance. _last_balance: {_last_balance}, delta: {numeric_delta}. Error: {e}")
+        else:
+            _last_balance = numeric_delta
+    return _last_balance
+
+def check_drawdown():
+    """
+    Checks whether the current balance exceeds the max allowed drawdown.
+    Returns False if too much has been lost, True otherwise.
+    """
+    bal = get_balance()
+    if bal and _last_balance:
+        drawdown = 1 - (bal / _last_balance)
+        return drawdown < MAX_TOTAL_DAILY_DRAWDOWN_PCT
+    return True  # Allow trading if unknown
+
+
+───────────────────────────────────────────────
+📄 utils\stream_fetcher.py
+───────────────────────────────────────────────
+
+# utils/stream_fetcher.py
+
+import threading
+import time
+from datetime import datetime, timedelta
+from collections import deque, defaultdict
+
+from lightstreamer.client import LightstreamerClient, Subscription
+
+# Tick buffers and bar aggregators
+_tick_buffers = defaultdict(lambda: deque())
+_bar_buffers = defaultdict(lambda: defaultdict(lambda: deque(maxlen=100)))
+_lock = threading.Lock()
+
+def _on_item_update(item_update):
+    epic = item_update.getItemName()
+    price = float(item_update.getValue("LTP") or 0)
+    ts = datetime.utcnow()
+    with _lock:
+        _tick_buffers[epic].append((ts, price))
+
+def start_streaming(api_key, cst, token, epics):
+    """
+    Connects to IG's Lightstreamer demo endpoint, subscribes to epics,
+    and starts a background thread to aggregate 5-minute bars.
+    """
+    client = LightstreamerClient("https://pushlightstream-demo.ig.com", "QUOTE_ADAPTER")
+
+    # Inject IG authentication headers
+    client.connectionDetails.httpExtraHeaders = {
+        "X-IG-API-KEY": api_key,
+        "CST": cst,
+        "X-SECURITY-TOKEN": token
+    }
+
+    # Establish connection
+    client.connect()
+
+    # Subscribe to Last Traded Price (LTP) updates for each epic
+    sub = Subscription("MERGE", epics, ["LTP"])
+    sub.setDataAdapter("QUOTE_ADAPTER")
+    sub.setRequestedSnapshot("no")
+    sub.addListener(_on_item_update)
+    client.subscribe(sub)
+
+    # Launch bar aggregation thread
+    threading.Thread(target=_aggregate_bars, args=(epics,), daemon=True).start()
+
+def _aggregate_bars(epics):
+    """
+    Every 5 minutes, builds OHLCV bars from tick buffer.
+    """
+    while True:
+        now = datetime.utcnow()
+        next_bound = (now + timedelta(minutes=5)).replace(second=0, microsecond=0)
+        time.sleep((next_bound - now).total_seconds())
+
+        with _lock:
+            for epic in epics:
+                ticks = list(_tick_buffers[epic])
+                _tick_buffers[epic].clear()
+                if not ticks:
+                    continue
+                prices = [p for _, p in ticks]
+                bar = {
+                    "timestamp": next_bound.isoformat(),
+                    "open": prices[0],
+                    "high": max(prices),
+                    "low": min(prices),
+                    "close": prices[-1],
+                    "volume": len(prices)
+                }
+                _bar_buffers[epic]["5MINUTE"].append(bar)
+
+def get_stream_bars(epic, resolution):
+    """
+    Returns aggregated bars for the given resolution.
+    Only "5MINUTE" is supported.
+    """
+    if resolution != "5MINUTE":
+        return []
+    with _lock:
+        return list(_bar_buffers[epic].get("5MINUTE", []))
+
+
+
+───────────────────────────────────────────────
+📄 utils\structure.py
+───────────────────────────────────────────────
+
+# utils/structure.py
+
+def detect_swing_breaks(candles):
+    """
+    Identify clean 3-candle swing breakouts/breakdowns:
+    - Bullish: three rising highs then breakout above the highest.
+    - Bearish: three falling lows then breakdown below the lowest.
+    """
+    signals = []
+    for i in range(3, len(candles)):
+        prev3  = candles[i-3:i]
+        highs  = [c["high"] for c in prev3]
+        lows   = [c["low"]  for c in prev3]
+        current = candles[i]
+
+        # Bullish swing breakout
+        if highs[0] < highs[1] < highs[2] and current["close"] > highs[2]:
+            signals.append({
+                "direction":    "buy",
+                "price":        current["close"],
+                "ATR":          current["ATR"],
+                "breakout":     True,
+                "volume":       current["volume"],
+                "avg_volume":   current["avg_volume"],
+                "ema_distance": current["ema_distance"],
+                "session":      current["session"]
+            })
+
+        # Bearish swing breakdown
+        if lows[0] > lows[1] > lows[2] and current["close"] < lows[2]:
+            signals.append({
+                "direction":    "sell",
+                "price":        current["close"],
+                "ATR":          current["ATR"],
+                "breakout":     True,
+                "volume":       current["volume"],
+                "avg_volume":   current["avg_volume"],
+                "ema_distance": current["ema_distance"],
+                "session":      current["session"]
+            })
+
+    return signals
+
+def detect_wick_rejections(candles):
+    """
+    Identify high-quality wick rejections:
+    - Wick length ≥ 1.5×ATR and body ≤ 0.3×ATR.
+    """
+    signals = []
+    for c in candles:
+        body = abs(c["close"] - c["open"])
+        # Wick calculation depends on bar direction
+        if c["close"] < c["open"]:
+            wick = max(c["high"] - c["close"], c["high"] - c["open"])
+        else:
+            wick = max(c["open"] - c["low"], c["close"] - c["low"])
+        atr = c["ATR"]
+
+        if wick >= 1.5 * atr and body <= 0.3 * atr:
+            signals.append({
+                "direction":    "sell" if c["close"] < c["open"] else "buy",
+                "price":        c["close"],
+                "ATR":          atr,
+                "wick_ratio":   wick / body if body > 0 else float("inf"),
+                "body_size":    body,
+                "wick_size":    wick,
+                "volume":       c["volume"],
+                "avg_volume":   c["avg_volume"],
+                "ema_distance": c["ema_distance"],
+                "trend_state":  c["trend_state"],
+                "session":      c["session"]
+            })
+
+    return signals
+
+def confirm_structure(candles, signal):
+    """
+    Basic market structure check:
+    - For longs: last close > previous close.
+    - For shorts: last close < previous close.
+    """
+    if len(candles) < 2:
+        return True
+    last_close = candles[-1]["close"]
+    prev_close = candles[-2]["close"]
+    if signal.get("direction") == "buy":
+        return last_close > prev_close
+    else:
+        return last_close < prev_close
+
+
+
+───────────────────────────────────────────────
+📄 utils\trade_executor.py
+───────────────────────────────────────────────
+
+import requests
+from config import IG_API_BASE_URL, IG_APP_KEY, IG_ACCOUNT_ID
+from utils.ig_auth import ig_login
+
+def get_live_ig_balance():
+    """
+    Retrieves your live account balance from the /accounts endpoint.
+    Searches for the account with accountId "Z4NFPN" (your spread betting account).
+    """
+    tokens = ig_login()
+    headers = {
+        "X-IG-API-KEY": IG_APP_KEY,
+        "X-IG-ACCOUNT-ID": IG_ACCOUNT_ID,
+        "CST": tokens.get("CST", ""),
+        "X-SECURITY-TOKEN": tokens.get("X-SECURITY-TOKEN", ""),
+        "Accept": "application/json"
+    }
+    response = requests.get(f"{IG_API_BASE_URL}/accounts", headers=headers, timeout=10)
+    response.raise_for_status()
+    data = response.json()
+    
+    accounts = data.get("accounts")
+    if not accounts:
+        raise ValueError("No accounts found in response")
+    
+    for account in accounts:
+        if account.get("accountId") == "Z4NFPN":
+            balance = account.get("accountInfo", {}).get("balance")
+            if balance is None:
+                raise ValueError("Balance field not found")
+            return float(balance)
+    
+    balance = accounts[0].get("accountInfo", {}).get("balance")
+    if balance is None:
+        raise ValueError("Balance field not found")
+    return float(balance)
+
+
+───────────────────────────────────────────────
+📄 utils\trailing_stop.py
+───────────────────────────────────────────────
+
+# utils/trailing_stop.py
+
+import threading
+import time
+from utils.data_fetcher import get_session
+from config import IG_API_BASE_URL
+
+def monitor_position(deal_ref, epic, direction, atr, initial_sl):
+    """
+    Monitors a live spread-bet position and updates its stop-loss to trail the price by 1×ATR.
+    """
+    sl = initial_sl
+    while True:
+        time.sleep(30)  # check every 30 seconds
+        session = get_session()
+        try:
+            # Fetch the latest 1-minute bar to get the current close price
+            resp = session.get(
+                f"{IG_API_BASE_URL}/prices/{epic}/HISTORICAL/1MINUTE",
+                params={"max": 1},
+                timeout=10
+            )
+            resp.raise_for_status()
+            data = resp.json().get("prices", []) or resp.json().get("candles", [])
+            if not data:
+                continue
+            last_price = data[-1]["close"]
+        except Exception:
+            continue
+
+        # Calculate a new stop-loss one ATR behind the current price
+        new_sl = (last_price - atr) if direction == "buy" else (last_price + atr)
+
+        # Only move the stop in the favorable direction
+        if direction == "buy" and new_sl > sl:
+            payload = {"dealReference": deal_ref, "stopLevel": new_sl}
+            session.put(f"{IG_API_BASE_URL}/positions/{deal_ref}", json=payload)
+            sl = new_sl
+        elif direction == "sell" and new_sl < sl:
+            payload = {"dealReference": deal_ref, "stopLevel": new_sl}
+            session.put(f"{IG_API_BASE_URL}/positions/{deal_ref}", json=payload)
+            sl = new_sl
